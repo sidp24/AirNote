@@ -17,31 +17,32 @@ def ema(prev, new, a=0.5):
 @dataclass
 class Stroke:
     mode: str = "draw"                        # "draw" or "erase"
-    color: Tuple[int,int,int]=(0,255,0)       # BGR (used only for draw)
+    color: Tuple[int,int,int]=(0,255,0)       # BGR
     width: int=3
     points: List[Tuple[float,float]] = field(default_factory=list)
 
 class BoardCanvas:
     """
-    Adds notetaking affordances: undo/redo, clear, multipage.
+    Notetaking canvas with pages, undo/redo, grid/dark bg, and sessionized saves.
     """
     def __init__(self, W=1200, H=800):
         self.W, self.H = W, H
         self.canvas = np.zeros((H, W, 4), dtype=np.uint8)
 
-        # Pages are lists of strokes
         self.pages: List[List[Stroke]] = [[]]
         self.page_idx = 0
+        self._redos: List[List[Stroke]] = [[]]
+
         self.current: Optional[Stroke] = None
         self._smooth_pt = None
 
-        # Per-page undo stacks (redo history)
-        self._redos: List[List[Stroke]] = [[]]  # mirrors pages by index
+        self.show_grid = True
+        self.dark_bg = False
 
-        self.show_grid = True   # grid toggle
-        self.dark_bg = False    # dark background toggle for contrast
+    # ---------- page helpers ----------
+    def page_count(self) -> int:
+        return len(self.pages)
 
-    # ---------- Page helpers ----------
     def _page(self) -> List[Stroke]:
         return self.pages[self.page_idx]
 
@@ -69,7 +70,7 @@ class BoardCanvas:
         self.pages[self.page_idx] = []
         self._redos[self.page_idx] = []
 
-    # ---------- Editing ----------
+    # ---------- edit ----------
     def undo(self):
         self.end()
         if self._page():
@@ -82,7 +83,7 @@ class BoardCanvas:
             s = self._redo_stack().pop()
             self._page().append(s)
 
-    # ---------- Drawing ----------
+    # ---------- draw ----------
     def begin(self, color, width, mode="draw"):
         self.current = Stroke(mode=str(mode), color=tuple(color), width=int(width))
         self._smooth_pt = None
@@ -100,9 +101,9 @@ class BoardCanvas:
             self._redo_stack().clear()
         self.current = None
 
-    # ---------- Rendering ----------
+    # ---------- render ----------
     def _draw_grid(self, target):
-        grid_color = (0,255,0,40)  # BGRA low alpha
+        grid_color = (0,255,0,40)
         step_x = max(60, self.W//12)
         step_y = max(60, self.H//12)
         for x in range(0, self.W, step_x):
@@ -112,14 +113,11 @@ class BoardCanvas:
 
     def _render_to(self, include_grid: bool):
         out = np.zeros((self.H, self.W, 4), dtype=np.uint8)
-
-        # optional faint background for contrast
         if self.dark_bg:
-            out[:,:,3] = 20  # tiny alpha backdrop
+            out[:,:,3] = 20  # subtle alpha plate for contrast
 
         erase_mask = np.full((self.H, self.W), 255, dtype=np.uint8)
         seq = self._page() + ([self.current] if self.current else [])
-
         for s in seq:
             if not s or len(s.points) < 2:
                 continue
@@ -128,7 +126,6 @@ class BoardCanvas:
                 for i in range(1, len(s.points)):
                     p0 = (int(s.points[i-1][0]), int(s.points[i-1][1]))
                     p1 = (int(s.points[i][0]),   int(s.points[i][1]))
-                    # stroke with light shadow to pop
                     cv2.line(out, (p0[0]+1,p0[1]+1), (p1[0]+1,p1[1]+1), (0,0,0,100), s.width+1, lineType=cv2.LINE_AA)
                     cv2.line(out, p0, p1, col, s.width, lineType=cv2.LINE_AA)
             else:
@@ -137,21 +134,20 @@ class BoardCanvas:
                     p1 = (int(s.points[i][0]),   int(s.points[i][1]))
                     cv2.line(erase_mask, p0, p1, 0, s.width, lineType=cv2.LINE_AA)
 
-        # apply eraser to alpha channel
         alpha = out[:,:,3]
         alpha = cv2.bitwise_and(alpha, erase_mask)
         out[:,:,3] = alpha
 
         if include_grid:
-            grid_layer = np.zeros_like(out)
-            self._draw_grid(grid_layer)
-            gb,gg,gr,ga = cv2.split(grid_layer)
+            grid = np.zeros_like(out)
+            self._draw_grid(grid)
+            gb,gg,gr,ga = cv2.split(grid)
             ob,og,or_,oa = cv2.split(out)
             ga_f = ga.astype(np.float32)/255.0
             inv = 1.0 - ga_f
-            b = (gb.astype(np.float32)* (ga.astype(np.float32)/255.0) + ob.astype(np.float32)*inv).astype(np.uint8)
-            g = (gg.astype(np.float32)* (ga.astype(np.float32)/255.0) + og.astype(np.float32)*inv).astype(np.uint8)
-            r = (gr.astype(np.float32)* (ga.astype(np.float32)/255.0) + or_.astype(np.float32)*inv).astype(np.uint8)
+            b = (gb.astype(np.float32)*ga_f + ob.astype(np.float32)*inv).astype(np.uint8)
+            g = (gg.astype(np.float32)*ga_f + og.astype(np.float32)*inv).astype(np.uint8)
+            r = (gr.astype(np.float32)*ga_f + or_.astype(np.float32)*inv).astype(np.uint8)
             a = np.clip(ga.astype(np.int32) + oa.astype(np.int32), 0, 255).astype(np.uint8)
             out = cv2.merge([b,g,r,a])
 
@@ -161,23 +157,39 @@ class BoardCanvas:
         self.canvas = self._render_to(include_grid=self.show_grid)
         return self.canvas
 
-    def save(self, out_dir="out", H0=None, curr_quad=None):
+    # ---------- persistence ----------
+    def save(
+        self,
+        out_root="out",
+        session_id: Optional[str]=None,
+        page_idx: Optional[int]=None,
+        H0=None,
+        curr_quad=None,
+        color_idx=None,
+        draw_width=None,
+        hotbar_idx=None,
+        page_count: Optional[int]=None
+    ):
         """
-        Saves:
-          - Clean rectified board (no grid): board_<ts>.png
-          - Preview (with grid): board_preview_<ts>.png
-          - strokes_<ts>.json (current page only, with modes)
-          - meta_<ts>.json (W,H,H0,curr_quad,page_idx)
+        Saves to out/<session_id>/:
+          - board_<page>_<ts>.png          (rectified, no grid)
+          - board_preview_<page>_<ts>.png  (with grid)
+          - strokes_<page>_<ts>.json       (current page strokes)
+          - meta_<ts>.json                 (session/page/tool metadata)
         """
-        os.makedirs(out_dir, exist_ok=True)
         ts = int(time.time())
-        clean_path = f"{out_dir}/board_{ts}.png"
-        preview_path = f"{out_dir}/board_preview_{ts}.png"
-        json_path = f"{out_dir}/strokes_{ts}.json"
-        meta_path = f"{out_dir}/meta_{ts}.json"
+        sid = session_id or str(ts)
+        page = self.page_idx if page_idx is None else int(page_idx)
+        out_dir = os.path.join(out_root, sid)
+        os.makedirs(out_dir, exist_ok=True)
 
         clean = self._render_to(include_grid=False)
         prevw = self._render_to(include_grid=True)
+
+        clean_path = os.path.join(out_dir, f"board_{page}_{ts}.png")
+        preview_path = os.path.join(out_dir, f"board_preview_{page}_{ts}.png")
+        json_path = os.path.join(out_dir, f"strokes_{page}_{ts}.json")
+        meta_path = os.path.join(out_dir, f"meta_{ts}.json")
 
         cv2.imwrite(clean_path, cv2.cvtColor(clean, cv2.COLOR_BGRA2BGR))
         cv2.imwrite(preview_path, cv2.cvtColor(prevw, cv2.COLOR_BGRA2BGR))
@@ -191,9 +203,15 @@ class BoardCanvas:
 
         meta = {
             "W": self.W, "H": self.H,
-            "page_idx": self.page_idx,
+            "page_idx": page,
+            "page_count": page_count if page_count is not None else self.page_count(),
+            "color_idx": int(color_idx) if color_idx is not None else None,
+            "draw_width": int(draw_width) if draw_width is not None else None,
+            "hotbar_idx": int(hotbar_idx) if hotbar_idx is not None else None,
             "H0": (np.asarray(H0).tolist() if H0 is not None else None),
-            "curr_quad": (np.asarray(curr_quad).tolist() if curr_quad is not None else None)
+            "curr_quad": (np.asarray(curr_quad).tolist() if curr_quad is not None else None),
+            "session_id": sid,
+            "timestamp": ts
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f)

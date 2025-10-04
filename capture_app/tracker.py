@@ -2,22 +2,39 @@ import cv2
 import numpy as np
 
 class PlanarTracker:
-    def __init__(self, init_quad, gray0, max_pts=600, inlier_thresh=35, freeze_frames=6):
+    """
+    LK + RANSAC homography tracker with:
+      - freeze fallback for brief dropouts
+      - auto-reseed after sustained low inliers
+      - simple hysteresis to avoid flip/flop after recovery
+    """
+    def __init__(
+        self,
+        init_quad,
+        gray0,
+        max_pts=600,
+        inlier_thresh=35,
+        freeze_frames=6,
+        reseed_low_streak_thresh=8,
+        hysteresis_frames=5,
+    ):
         """
-        init_quad: 4x2 float32 array of image-space corner points (clockwise)
-        gray0: first grayscale frame (already preprocessed, e.g., CLAHE)
+        init_quad: (4,2) float32 image-space corners (clockwise)
+        gray0: initial grayscale (already CLAHE'd)
         """
-        self.quad0 = np.array(init_quad, dtype=np.float32)  # original picked quad (image space)
-        self.quad = np.array(init_quad, dtype=np.float32)   # last estimated quad
+        self.quad0 = np.array(init_quad, dtype=np.float32)
+        self.quad = np.array(init_quad, dtype=np.float32)
 
         self.inlier_thresh = int(inlier_thresh)
         self.freeze_frames = int(freeze_frames)
+        self.reseed_low_streak_thresh = int(reseed_low_streak_thresh)
+        self.hysteresis_frames = int(hysteresis_frames)
 
-        # Mask only the selected quad
+        # region mask
         self.mask = np.zeros_like(gray0, dtype=np.uint8)
         cv2.fillConvexPoly(self.mask, self.quad.astype(int), 255)
 
-        # Track more points and be a bit more permissive to survive low texture
+        # seed features
         self.pts0 = cv2.goodFeaturesToTrack(
             gray0, mask=self.mask,
             maxCorners=max_pts,
@@ -27,104 +44,104 @@ class PlanarTracker:
         )
         self.gray_prev = gray0
 
-        # Homography bookkeeping
-        self.H_t = None              # last *effective* H used externally (may be frozen)
-        self._last_good_H = None     # last *freshly-estimated* good H
-        self._low_streak = 0         # consecutive low-inlier frames
+        # state
+        self.H_t = None
+        self._last_good_H = None
+        self._low_streak = 0
+        self._freeze_left = 0
+        self._hysteresis_left = 0
         self.ok = False
 
-        # --- Debug visualization state (set every update) ---
-        self.last_good0 = None         # (N,2) prev-frame points
-        self.last_good1 = None         # (N,2) curr-frame points
-        self.last_inliers_mask = None  # (N,) bool
+        # events/flags (main reads & clears)
+        self.need_reseed = False
+        self.just_reseeded = False
+
+        # debug
+        self.last_good0 = None
+        self.last_good1 = None
+        self.last_inliers_mask = None
 
     def update(self, gray1):
-        """
-        Update tracking with new grayscale frame.
-        Applies freeze fallback for brief inlier dropouts.
-        Returns (H_eff, inlier_count) where H_eff may be frozen.
-        """
+        """Returns (H_eff, inliers). H_eff may be frozen/held by hysteresis."""
         if self.pts0 is None or len(self.pts0) < 8:
-            self.ok = False
-            self.last_good0 = self.last_good1 = None
-            self.last_inliers_mask = None
-            return None, 0
+            return self._bad_return(gray1)
 
-        # Pyramidal Lucas–Kanade optical flow
         pts1, st, err = cv2.calcOpticalFlowPyrLK(
             self.gray_prev, gray1, self.pts0, None,
             winSize=(21,21), maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
-
         good0 = self.pts0[st==1]
         good1 = pts1[st==1]
         if len(good0) < 8:
-            # No estimate; maybe freeze?
-            H_eff = self._maybe_freeze(None)
-            self._set_debug(None, None, None)
-            self.gray_prev = gray1
-            self.pts0 = good1.reshape(-1,1,2) if good1 is not None and len(good1) else self.pts0
-            return H_eff, 0
+            return self._maybe_freeze_and_mark_low(gray1, good1, 0)
 
-        # Robust homography with RANSAC
         H, inliers = cv2.findHomography(good0, good1, cv2.RANSAC, 3.0)
         inl = int(inliers.sum()) if inliers is not None else 0
 
-        # Keep debug info
-        self._set_debug(good0.reshape(-1, 2), good1.reshape(-1, 2),
-                        inliers.reshape(-1).astype(bool) if inliers is not None else None)
+        # debug bookkeeping
+        self.last_good0 = good0.reshape(-1,2)
+        self.last_good1 = good1.reshape(-1,2)
+        self.last_inliers_mask = inliers.reshape(-1).astype(bool) if inliers is not None else None
 
-        # Update internal state for next round
+        # advance LK state
         self.gray_prev = gray1
         self.pts0 = good1.reshape(-1,1,2)
 
+        # decision
         if H is not None and inl >= self.inlier_thresh:
-            # Fresh, good estimate
+            # fresh good estimate
             self._last_good_H = H
             self._low_streak = 0
+            self._freeze_left = 0
+            # kick hysteresis so we don't immediately collapse if next frame is borderline
+            self._hysteresis_left = self.hysteresis_frames
             self.ok = True
             self.H_t = H
-            # Update quad estimate from fresh H
             self.quad = cv2.perspectiveTransform(self.quad0.reshape(-1,1,2), H).reshape(4,2)
             return self.H_t, inl
 
-        # Otherwise try freezing to the last good H for a few frames
-        H_eff = self._maybe_freeze(H)
-        return H_eff, inl
+        # low inliers
+        self._low_streak = min(self._low_streak + 1, 1_000_000)
+        if self._low_streak >= self.reseed_low_streak_thresh:
+            # suggest reseed; main will call reseed(gray) this frame
+            self.need_reseed = True
+        return self._maybe_freeze(gray1, inl)
 
-    def _maybe_freeze(self, H_candidate):
-        """
-        If current H is bad, but we have a last good H and haven't exceeded freeze window,
-        reuse last good H to keep overlay stable.
-        """
-        if H_candidate is not None:
-            # Caller can still pass a candidate; if it's bad, we fall through to freeze logic.
-            pass
+    # ---- helpers ----
+    def _bad_return(self, gray1):
+        self.ok = False
+        self.last_good0 = self.last_good1 = None
+        self.last_inliers_mask = None
+        self.gray_prev = gray1
+        return None, 0
 
-        if self._last_good_H is not None and self._low_streak < self.freeze_frames:
-            self._low_streak += 1
+    def _maybe_freeze_and_mark_low(self, gray1, good1, inl):
+        self._low_streak = min(self._low_streak + 1, 1_000_000)
+        if self._low_streak >= self.reseed_low_streak_thresh:
+            self.need_reseed = True
+        self.gray_prev = gray1
+        if good1 is not None and len(good1):
+            self.pts0 = good1.reshape(-1,1,2)
+        return self._maybe_freeze(gray1, inl)
+
+    def _maybe_freeze(self, gray1, inl):
+        # Use last good H while we wait out brief dips, or hysteresis window
+        if self._last_good_H is not None and (self._freeze_left < self.freeze_frames or self._hysteresis_left > 0):
             self.ok = True
             self.H_t = self._last_good_H
-            # Keep quad based on last good H
+            self._freeze_left = min(self.freeze_frames, self._freeze_left + 1)
+            self._hysteresis_left = max(0, self._hysteresis_left - 1)
             self.quad = cv2.perspectiveTransform(self.quad0.reshape(-1,1,2), self.H_t).reshape(4,2)
-            return self.H_t
+            return self.H_t, inl
 
-        # No freeze available; tracking is considered bad
+        # out of freeze/hysteresis and no good H
         self.ok = False
         self.H_t = None
-        return None
-
-    def _set_debug(self, good0, good1, inliers_mask):
-        self.last_good0 = good0
-        self.last_good1 = good1
-        self.last_inliers_mask = inliers_mask
+        return None, inl
 
     def reseed(self, gray, quad=None, max_pts=600):
-        """
-        Reseed features inside the given quad (or current quad) without redefining corners.
-        Use when tracking starts to feel sparse or after pressing Shift+R.
-        """
+        """Reseed features inside the given quad (or last-estimated)."""
         if quad is None:
             quad = self.quad if self.quad is not None else self.quad0
         quad = np.array(quad, dtype=np.float32)
@@ -139,4 +156,6 @@ class PlanarTracker:
             blockSize=5
         )
         self.gray_prev = gray
-        # Keep last good H so freeze logic can continue
+        self.need_reseed = False
+        self.just_reseeded = True
+        # keep last_good_H so freeze continues to operate
