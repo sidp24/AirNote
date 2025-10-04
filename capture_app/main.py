@@ -8,6 +8,12 @@ from tracker import PlanarTracker
 from board_canvas import BoardCanvas, warp_point
 from utils import alpha_blend
 
+# Optional Firebase uploader
+try:
+    from uploader import FirebaseUploader
+except Exception:
+    FirebaseUploader = None
+
 # ---------- Config ----------
 BOARD_W, BOARD_H = 1200, 800
 DEFAULT_WIDTH = 5
@@ -48,6 +54,12 @@ save_flash_until = 0
 mouse_draw = False
 mouse_down = False
 mouse_pos = (0,0)
+
+# Firebase runtime
+firebase_uploader = None
+FB_PROJECT = ""
+FB_BUCKET = ""
+FB_PUBLIC = False
 
 def now_ms(): return int(time.time()*1000)
 
@@ -99,6 +111,7 @@ def main():
     global last_gate_pinch, last_tool_pinch, tool_pinch_down_ms, tool_pinch_progress
     global last_action_text, last_action_until, save_flash_until
     global mouse_draw, mouse_down, mouse_pos
+    global firebase_uploader, FB_PROJECT, FB_BUCKET, FB_PUBLIC
 
     # CLI
     ap = argparse.ArgumentParser(description="AirNote Capture App")
@@ -106,8 +119,14 @@ def main():
     ap.add_argument("--mirror", action="store_true")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--fb_project", type=str, default="", help="Firebase project id")
+    ap.add_argument("--fb_bucket", type=str, default="", help="Firebase Storage bucket (e.g. myapp.appspot.com)")
+    ap.add_argument("--fb_public", action="store_true", help="Make uploaded files public")
     args = ap.parse_args()
     MIRROR_DISPLAY = bool(args.mirror)
+    FB_PROJECT = args.fb_project
+    FB_BUCKET = args.fb_bucket
+    FB_PUBLIC = bool(args.fb_public)
 
     # Camera
     cap = cv2.VideoCapture(args.cam)
@@ -124,6 +143,15 @@ def main():
     H_curr = None
     board = None
     corners = []
+
+    # Firebase (lazy) init
+    if FB_PROJECT and FB_BUCKET and FirebaseUploader is not None:
+        try:
+            firebase_uploader = FirebaseUploader(project_id=FB_PROJECT, bucket_name=FB_BUCKET)
+            print("[Firebase] Initialized")
+        except Exception as e:
+            print("[Firebase] init failed:", e)
+            firebase_uploader = None
 
     # Mouse fallback
     def on_mouse(event, x, y, flags, param):
@@ -271,7 +299,7 @@ def main():
                         board.new_page(); set_action("New page")
                     elif sel == "SAVE" and board is not None:
                         curr_quad = cv2.perspectiveTransform(np.float32([corners]).reshape(-1,1,2), tracker.H_t).reshape(4,2)
-                        board.save(
+                        clean_path, json_path, preview_path, meta_path = board.save(
                             out_root="out",
                             session_id=session_id,
                             page_idx=board.page_idx,
@@ -284,6 +312,42 @@ def main():
                         )
                         set_action("Saved")
                         save_flash_until = now_ms() + 250
+
+                        # Firebase upload (if configured)
+                        if firebase_uploader is not None:
+                            files = {
+                                "board_png": clean_path,
+                                "board_preview_png": preview_path,
+                                "strokes_json": json_path,
+                                "meta_json": meta_path,
+                            }
+                            meta = {
+                                "W": board.W, "H": board.H,
+                                "page_idx": board.page_idx,
+                                "page_count": board.page_count(),
+                                "color_idx": color_idx,
+                                "draw_width": DRAW_WIDTH,
+                                "hotbar_idx": hotbar_idx,
+                                "H0": H0.tolist() if H0 is not None else None,
+                                "curr_quad": curr_quad.tolist() if curr_quad is not None else None,
+                                "session_id": session_id,
+                            }
+                            save_ts = int(time.time())
+                            try:
+                                res = firebase_uploader.upload_save(
+                                    session_id=session_id,
+                                    save_ts=save_ts,
+                                    files=files,
+                                    meta=meta,
+                                    make_public=FB_PUBLIC,
+                                    extra_fields={"source": "AirNote"}
+                                )
+                                set_action("Saved & uploaded")
+                                print("[Firebase] Uploaded:", res["files"])
+                                print("[Firebase] Doc:", res["firestore_path"])
+                            except Exception as e:
+                                print("[Firebase] upload failed:", e)
+                                set_action("Saved (upload failed)")
 
             if tool_pinch and tool_pinch_down_ms > 0:
                 tool_pinch_progress = min(1.0, (now_ms() - tool_pinch_down_ms) / float(SAVE_LONG_MS))
@@ -325,13 +389,6 @@ def main():
             orig = np.float32([corners]).reshape(-1,1,2)
             curr = cv2.perspectiveTransform(orig, tracker.H_t).reshape(4,2).astype(int)
             cv2.polylines(out, [curr], True, (0,255,0), 2)
-
-        # Debug points (optional—toggle by editing code if needed)
-        # if tracker.last_good1 is not None:
-        #     pts = tracker.last_good1.astype(int); mask = tracker.last_inliers_mask
-        #     for i,p in enumerate(pts):
-        #         col = (0,255,0) if (mask is not None and mask[i]) else (0,0,255)
-        #         cv2.circle(out, (p[0], p[1]), 2, col, -1)
 
         # HUD
         curr_fps = tick_fps()
