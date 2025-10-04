@@ -3,26 +3,38 @@ import cv2
 import numpy as np
 
 from hand_state import HandsDetector, parse_hands, fingertip
-from plane_select import draw_reticle, compute_H0  # ordering enforced inside compute_H0
+from plane_select import draw_reticle, compute_H0
 from tracker import PlanarTracker
 from board_canvas import BoardCanvas, warp_point
 from utils import alpha_blend
 
-# ------ Defaults ------
+# ------ Board Defaults ------
 BOARD_W, BOARD_H = 1200, 800
 DRAW_WIDTH = 5
-COLORS = [(0,255,0),(255,0,0),(0,140,255),(255,255,255)]
+COLORS = [(0,255,0),(255,0,0),(0,140,255),(255,255,255)]  # BGR
 
 # ------ Runtime state ------
 color_idx = 0
 state = "IDLE"       # IDLE, DRAW, ERASE
-last_left_pinch = False
 debounce_until = 0
 DEBUG_DRAW = False
 _last_t = None
 fps = 0.0
 
-# Mouse helpers
+# Hands-first UX state
+tool_mode = "DRAW"          # active drawing tool: "DRAW" | "ERASE"
+last_gate_pinch = False     # right-hand pinch (gate)
+last_tool_pinch = False     # left-hand pinch (cycles/activates)
+tool_pinch_down_ms = 0
+tool_pinch_progress = 0.0   # 0..1 for long-press ring
+SAVE_LONG_MS = 700
+TOGGLE_TAP_MS = 300
+
+# Hotbar items & selection
+HOTBAR = ["DRAW", "ERASE", "COLOR", "WIDTH", "UNDO", "REDO", "CLEAR", "NEW", "SAVE"]
+hotbar_idx = 0
+
+# Mouse helpers (optional fallback)
 mouse_draw = False
 mouse_down = False
 mouse_pos = (0,0)
@@ -47,9 +59,57 @@ def tick_fps():
         fps = (0.9*fps + 0.1*(1.0/dt)) if fps > 0 else (1.0/dt)
     return fps
 
+def draw_progress_ring(img, center, radius, t01, color=(0,255,255)):
+    t01 = max(0.0, min(1.0, float(t01)))
+    if t01 <= 0: return
+    start_angle = -90
+    end_angle = start_angle + int(360 * t01)
+    cv2.ellipse(img, center, (radius, radius), 0, start_angle, end_angle, color, 2, lineType=cv2.LINE_AA)
+
+def draw_hotbar(img, w, h, selected_idx, draw_width, color_bgr, font_scale=0.5):
+    """Render a bottom hotbar with the current selection highlighted."""
+    margin = 10
+    bar_h = 58
+    y0 = h - bar_h - margin
+    cv2.rectangle(img, (margin, y0), (w - margin, h - margin), (30,30,30), thickness=2)
+
+    items = HOTBAR
+    n = len(items)
+    cell_w = int((w - 2*margin) / n)
+
+    for i, name in enumerate(items):
+        x0 = margin + i*cell_w
+        x1 = margin + (i+1)*cell_w
+        # cell background
+        if i == selected_idx:
+            cv2.rectangle(img, (x0+1, y0+1), (x1-1, h - margin - 1), (50,100,50), thickness=-1)
+        else:
+            cv2.rectangle(img, (x0+1, y0+1), (x1-1, h - margin - 1), (25,25,25), thickness=-1)
+        cv2.rectangle(img, (x0+1, y0+1), (x1-1, h - margin - 1), (100,100,100), thickness=1)
+
+        label = name
+        # augment label or draw icon for COLOR/WIDTH
+        if name == "COLOR":
+            # show current color swatch
+            box_w, box_h = 20, 14
+            bx = x0 + (cell_w - box_w)//2
+            by = y0 + 6
+            cv2.rectangle(img, (bx, by), (bx+box_w, by+box_h), color_bgr, thickness=-1)
+            cv2.rectangle(img, (bx, by), (bx+box_w, by+box_h), (0,0,0), thickness=1)
+            label = "COLOR"
+        elif name == "WIDTH":
+            label = f"W:{draw_width}"
+
+        (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        tx = x0 + (cell_w - tw)//2
+        ty = y0 + bar_h - 16
+        cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (220,220,220), 1)
+
 def main():
-    global state, color_idx, DRAW_WIDTH, last_left_pinch, DEBUG_DRAW
+    global state, color_idx, DRAW_WIDTH, DEBUG_DRAW
     global mouse_draw, mouse_down, mouse_pos
+    global tool_mode, last_gate_pinch, last_tool_pinch, tool_pinch_down_ms, tool_pinch_progress
+    global hotbar_idx
 
     # ---- CLI ----
     parser = argparse.ArgumentParser(description="AirNote Capture App")
@@ -73,7 +133,7 @@ def main():
     board = None
     corners = []
 
-    # ---- Mouse callback ----
+    # ---- Mouse (optional fallback) ----
     def _on_mouse(event, x, y, flags, param):
         nonlocal tracker, H0, H_curr, board, corners
         global state, color_idx, DRAW_WIDTH, mouse_draw, mouse_down, mouse_pos
@@ -104,7 +164,7 @@ def main():
     cv2.namedWindow("AirNote - Capture")
     cv2.setMouseCallback("AirNote - Capture", _on_mouse)
 
-    # ---- Contrast improver for tracking ----
+    # ---- CLAHE for tracking ----
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
 
     while True:
@@ -118,61 +178,44 @@ def main():
         # Hands
         res = hd.process(rgb)
         hands = parse_hands(res, w, h)
-        left = hands.get("Left"); right = hands.get("Right")
-        left_pinch = bool(left and left["pinch"])
-        right_point = bool(right and right["point"])
-        right_pinch = bool(right and right["pinch"])
-        tip = fingertip(right["landmarks"]) if right else None
+        left = hands.get("Left")     # tool hand (pinch cycles/activates; point draws when DRAW)
+        right = hands.get("Right")   # gate hand (pinch holds to arm)
 
+        gate_pinch = bool(right and right["pinch"])            # right = gate
+        tool_point = bool(left and left["point"])              # left index extend
+        tool_pinch = bool(left and left["pinch"])              # left pinch
+        tip = fingertip(left["landmarks"]) if left else None   # left fingertip
+
+        # Minimal keys remain as backups only
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
             break
-        if key == ord('c'): color_idx = (color_idx + 1) % len(COLORS)
-        if key == ord('e'): state = "ERASE" if state != "ERASE" else "IDLE"  # manual toggle (still have gestures)
-        if key == ord('['): DRAW_WIDTH = max(1, DRAW_WIDTH - 1)
-        if key == ord(']'): DRAW_WIDTH += 1
         if key == ord('t'): DEBUG_DRAW = not DEBUG_DRAW
         if key == ord('m'): mouse_draw = not mouse_draw
         if key == ord('g') and board is not None: board.show_grid = not board.show_grid
-        if key == ord('b') and board is not None: board.dark_bg = not board.dark_bg  # contrast bg
-        if key == ord('u') and board is not None: board.undo()
-        if key == ord('y') and board is not None: board.redo()
-        if key == ord('x') and board is not None: board.clear_page()
-        if key == ord('n') and board is not None: board.new_page()
-        if key == ord(',') and board is not None: board.prev_page()
-        if key == ord('.') and board is not None: board.next_page()
-        # Shift+R -> reseed features without redefining corners
-        if key == ord('R'):  # uppercase R is 82 with cv2.waitKey? safer to catch both:
-            pass
+        if key == ord('b') and board is not None: board.dark_bg = not board.dark_bg
+        if key == ord('R') and tracker is not None:
+            gray_now = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            tracker.reseed(gray_now, quad=None)
         if key == ord('r'):
-            if tracker is not None and H0 is not None and H_curr is not None and board is not None and len(corners)==4:
-                # SHIFT held?
-                import ctypes
-                if bool(ctypes.windll.user32.GetKeyState(0x10) & 0x8000):  # VK_SHIFT on Windows; noop on non-Windows
-                    gray_now = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-                    tracker.reseed(gray_now, quad=None)
-                else:
-                    # full re-lock
-                    H0 = None
-                    H_curr = None
-                    corners = []
-                    tracker = None
-                    board = None
-                    state = "IDLE"
-                    last_left_pinch = False
+            H0 = None; H_curr = None; corners = []; tracker = None; board = None
+            state = "IDLE"
+            last_gate_pinch = last_tool_pinch = False
+            tool_pinch_down_ms = 0; tool_pinch_progress = 0.0
+            tool_mode = "DRAW"; hotbar_idx = 0
 
         # ---------- Plane selection ----------
         if H0 is None:
             ret = (w//2, h//2)
-            if left and left.get("landmarks"):
-                ret = (left["landmarks"][8][0], left["landmarks"][8][1])
+            if right and right.get("landmarks"):
+                ret = (right["landmarks"][8][0], right["landmarks"][8][1])
             draw_reticle(frame, ret, (0,255,255))
-            cv2.putText(frame, f"Place corner {len(corners)+1}/4 (left-pinch or mouse click)",
+            cv2.putText(frame, f"Place corner {len(corners)+1}/4 (right-pinch or mouse click)",
                         (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-            if left_pinch and not last_left_pinch and len(corners) < 4:
+            if gate_pinch and not last_gate_pinch and len(corners) < 4:
                 corners.append(ret)
-            last_left_pinch = left_pinch
+            last_gate_pinch = gate_pinch
 
             for i,p in enumerate(corners):
                 cv2.circle(frame, p, 6, (0,200,0), -1)
@@ -185,7 +228,7 @@ def main():
                 tracker = PlanarTracker(corners, gray0)
                 board = BoardCanvas(BOARD_W, BOARD_H)
                 H_curr = H0
-                last_left_pinch = False
+                last_gate_pinch = False
 
             show = cv2.flip(frame, 1) if MIRROR_DISPLAY else frame
             cv2.imshow("AirNote - Capture", show)
@@ -196,8 +239,8 @@ def main():
         Ht, inl = tracker.update(gray)
         ok_track = tracker.ok and Ht is not None
         if ok_track:
-            text = f"Track inliers: {inl}"
-            cv2.putText(frame, text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 1)
+            cv2.putText(frame, f"Track inliers: {inl}", (20,40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 1)
             corners_np = np.float32([corners]).reshape(-1,1,2)
             curr = cv2.perspectiveTransform(corners_np, tracker.H_t).reshape(4,2)
             H_curr, _, _ = compute_H0(curr, BOARD_W, BOARD_H)
@@ -205,28 +248,84 @@ def main():
             cv2.putText(frame, "Re-lock (press R) - low track",
                         (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
 
-        # ---------- Gesture FSM (left pinch = gate) ----------
-        if board is not None and H_curr is not None:
-            if left_pinch:
-                if can_transition():
-                    if right_point and state != "DRAW":
+        # ---------- Hotbar gestures ----------
+        # Cycle/activate happen whenever gate is held (to avoid accidental pinches when resting).
+        if gate_pinch:
+            if tool_pinch and not last_tool_pinch:
+                tool_pinch_down_ms = now_ms()
+            if (not tool_pinch) and last_tool_pinch:
+                dur = now_ms() - tool_pinch_down_ms
+                tool_pinch_progress = 0.0
+                tool_pinch_down_ms = 0
+                if dur < TOGGLE_TAP_MS:
+                    # quick tap -> select next item
+                    hotbar_idx = (hotbar_idx + 1) % len(HOTBAR)
+                    # NEW: if the newly selected item is a tool, make it active immediately
+                    sel = HOTBAR[hotbar_idx]
+                    if sel in ("DRAW", "ERASE"):
+                        # end any current stroke, switch tool
                         if state in ("DRAW","ERASE"):
                             board.end()
-                        state = "DRAW"
-                        board.begin(COLORS[color_idx], DRAW_WIDTH, mode="draw")
-                        set_debounce()
-                    elif right_pinch and state != "ERASE":
-                        if state in ("DRAW","ERASE"):
-                            board.end()
-                        state = "ERASE"
-                        board.begin(COLORS[color_idx], DRAW_WIDTH, mode="erase")
-                        set_debounce()
+                            state = "IDLE"
+                        tool_mode = sel
+                elif dur >= SAVE_LONG_MS:
+                    # long press -> activate selected item
+                    sel = HOTBAR[hotbar_idx]
+                    if sel == "DRAW":
+                        tool_mode = "DRAW"
+                    elif sel == "ERASE":
+                        tool_mode = "ERASE"
+                    elif sel == "COLOR":
+                        color_idx = (color_idx + 1) % len(COLORS)
+                    elif sel == "WIDTH":
+                        DRAW_WIDTH = min(24, DRAW_WIDTH + 2) if DRAW_WIDTH < 24 else 4
+                    elif sel == "UNDO" and board is not None:
+                        board.undo()
+                    elif sel == "REDO" and board is not None:
+                        board.redo()
+                    elif sel == "CLEAR" and board is not None:
+                        board.clear_page()
+                    elif sel == "NEW" and board is not None:
+                        board.new_page()
+                    elif sel == "SAVE" and board is not None:
+                        curr_quad = cv2.perspectiveTransform(
+                            np.float32([corners]).reshape(-1,1,2), tracker.H_t
+                        ).reshape(4,2)
+                        board.save(H0=H0, curr_quad=curr_quad)
+
+            if tool_pinch and tool_pinch_down_ms > 0:
+                tool_pinch_progress = min(1.0, (now_ms() - tool_pinch_down_ms) / float(SAVE_LONG_MS))
+            else:
+                tool_pinch_progress = 0.0
+
+        last_tool_pinch = tool_pinch
+        last_gate_pinch = gate_pinch
+
+        # ---------- Tool execution (drawing/erasing) ----------
+        if board is not None and H_curr is not None and gate_pinch:
+            # enter/maintain DRAW/ERASE when left hand pose matches selected tool
+            active_pose = False
+            if tool_mode == "DRAW":
+                active_pose = tool_point
+            elif tool_mode == "ERASE":
+                active_pose = True  # eraser does not require pointing; any movement with gate on
+
+            if active_pose:
+                if can_transition() and state != tool_mode:
+                    if state in ("DRAW","ERASE"):
+                        board.end()
+                    state = tool_mode
+                    board.begin(COLORS[color_idx], DRAW_WIDTH, mode=("draw" if tool_mode=="DRAW" else "erase"))
                 if tip is not None and state in ("DRAW","ERASE"):
                     xb, yb = warp_point(H_curr, tip[0], tip[1])
                     board.add_point(xb, yb)
             else:
                 if state in ("DRAW","ERASE"):
                     board.end()
+                    state = "IDLE"
+        else:
+            if state in ("DRAW","ERASE"):
+                board.end()
                 state = "IDLE"
 
         # ---------- Overlay ----------
@@ -263,30 +362,19 @@ def main():
         cv2.putText(out, f"State: {state}", (20,70), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0,255,0) if state!="IDLE" else (200,200,200), 2)
         cv2.putText(out, f"FPS: {curr_fps:.1f}", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        help_text = ("M: mouse-draw [{0}]   T: debug   G: grid   B: bg "
-                     "  C: color   [: thinner   ]: thicker   "
-                     "U: undo   Y: redo   X: clear   N: new   <: prev   >: next   "
-                     "R: re-lock (Shift+R reseed)   S: save").format('ON' if mouse_draw else 'OFF')
-        cv2.putText(out, help_text, (20,h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220,220,220), 1)
-        cv2.rectangle(out, (w-180,20), (w-20,80), COLORS[color_idx], 2)
-        cv2.putText(out, f"W:{DRAW_WIDTH}", (w-170,70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
 
-        # Tool HUD near fingertip while gated
-        if left_pinch and tip is not None:
-            label = "DRAW" if state=="DRAW" else ("ERASE" if state=="ERASE" else "")
-            if label:
-                cv2.putText(out, label, (tip[0]+12, tip[1]-12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+        # Tool label near fingertip + long-press ring
+        if tip is not None:
+            label = tool_mode
+            cv2.putText(out, label, (tip[0]+14, tip[1]-14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+            if tool_pinch_progress > 0:
+                draw_progress_ring(out, (tip[0], tip[1]), 14, tool_pinch_progress, color=(0,200,255))
 
-        # Save (also write meta)
-        if key == ord('s'):
-            # Current quad in image space (ints for readability)
-            curr_quad = cv2.perspectiveTransform(np.float32([corners]).reshape(-1,1,2), tracker.H_t).reshape(4,2)
-            img_path, json_path, preview_path, meta_path = board.save(H0=H0, curr_quad=curr_quad)
-            cv2.putText(out, f"Saved: {img_path}", (20,h-15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
+        # Bottom hotbar
+        draw_hotbar(out, w, h, hotbar_idx, DRAW_WIDTH, COLORS[color_idx])
 
-        # Thumbnail
+        # Thumbnail (top-left)
         thumb = cv2.cvtColor(board_img, cv2.COLOR_BGRA2BGR)
         th = 150
         tw = int(thumb.shape[1] * (th / thumb.shape[0]))
@@ -301,3 +389,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
