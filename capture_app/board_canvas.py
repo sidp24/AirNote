@@ -22,7 +22,8 @@ class Stroke:
 class BoardCanvas:
     def __init__(self, W=1200, H=800):
         self.W, self.H = W, H
-        self.canvas = np.zeros((H, W, 4), dtype=np.uint8)  # RGBA
+        # RGBA canvas: initialize fully transparent
+        self.canvas = np.zeros((H, W, 4), dtype=np.uint8)
         self.strokes: List[Stroke] = []
         self.current: Stroke|None = None
         self._smooth_pt = None
@@ -46,13 +47,24 @@ class BoardCanvas:
 
     def render(self):
         # redraw from strokes to keep canvas clean after erases
+        # start with fully transparent canvas
         self.canvas[:] = 0
+        # light grid
+        grid_color = (255,255,255,18)
+        step_x = max(50, self.W//12)
+        step_y = max(50, self.H//12)
+        for x in range(0, self.W, step_x):
+            cv2.line(self.canvas, (x,0), (x,self.H), grid_color, 1)
+        for y in range(0, self.H, step_y):
+            cv2.line(self.canvas, (0,y), (self.W,y), grid_color, 1)
         for s in self.strokes + ([self.current] if self.current else []):
             if not s or len(s.points)<2: continue
             for i in range(1, len(s.points)):
                 p0 = (int(s.points[i-1][0]), int(s.points[i-1][1]))
                 p1 = (int(s.points[i][0]), int(s.points[i][1]))
-                cv2.line(self.canvas, p0, p1, (*s.color, 255), s.width)
+                # draw into BGRA canvas
+                col = (int(s.color[2]), int(s.color[1]), int(s.color[0]), 255)
+                cv2.line(self.canvas, p0, p1, col, s.width)
         return self.canvas
 
     def save(self, out_dir="out"):
