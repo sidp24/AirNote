@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 out
+venv_api
+node_modules
 
 # C extensions
 *.so
@@ -138,6 +140,7 @@ capture_app/__pycache__/
 capture_app/*.log
 capture_app/.cache/
 capture_app/media/
+serviceAccount.json
 
 # Keep README tracked
 !README.md
