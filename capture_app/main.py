@@ -61,6 +61,11 @@ FB_PROJECT = ""
 FB_BUCKET = ""
 FB_PUBLIC = False
 
+# Autosave
+AUTOSAVE_MS = 5000
+last_autosave_ms = 0
+dirty_since_save = False
+
 def now_ms(): return int(time.time()*1000)
 
 def set_action(msg, ms=1000):
@@ -106,12 +111,62 @@ def draw_hotbar(img, w, h, selected_idx, draw_width, color_bgr, font_scale=0.5):
         tx = x0 + (cell_w - tw)//2; ty = y0 + bar_h - 16
         cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (220,220,220), 1)
 
+def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx, firebase_uploader, auto=False):
+    """
+    Centralized save (local + optional Firebase). Returns boolean success.
+    """
+    try:
+        clean_path, json_path, preview_path, meta_path = board.save(
+            out_root="out",
+            session_id=session_id,
+            page_idx=board.page_idx,
+            H0=H0,
+            curr_quad=curr_quad,
+            color_idx=color_idx,
+            draw_width=DRAW_WIDTH,
+            hotbar_idx=hotbar_idx,
+            page_count=board.page_count()
+        )
+        if firebase_uploader is not None:
+            files = {
+                "board_png": clean_path,
+                "board_preview_png": preview_path,
+                "strokes_json": json_path,
+                "meta_json": meta_path,
+            }
+            meta = {
+                "W": board.W, "H": board.H,
+                "page_idx": board.page_idx,
+                "page_count": board.page_count(),
+                "color_idx": color_idx,
+                "draw_width": DRAW_WIDTH,
+                "hotbar_idx": hotbar_idx,
+                "H0": H0.tolist() if H0 is not None else None,
+                "curr_quad": curr_quad.tolist() if curr_quad is not None else None,
+                "session_id": session_id,
+            }
+            save_ts = int(time.time())
+            extra = {"source": "AirNote", "auto": bool(auto)}
+            firebase_uploader.upload_save(
+                session_id=session_id,
+                save_ts=save_ts,
+                files=files,
+                meta=meta,
+                make_public=FB_PUBLIC,
+                extra_fields=extra
+            )
+        return True
+    except Exception as e:
+        print("[Save] failed:", e)
+        return False
+
 def main():
     global state, color_idx, DRAW_WIDTH, tool_mode, hotbar_idx
     global last_gate_pinch, last_tool_pinch, tool_pinch_down_ms, tool_pinch_progress
     global last_action_text, last_action_until, save_flash_until
     global mouse_draw, mouse_down, mouse_pos
     global firebase_uploader, FB_PROJECT, FB_BUCKET, FB_PUBLIC
+    global AUTOSAVE_MS, last_autosave_ms, dirty_since_save
 
     # CLI
     ap = argparse.ArgumentParser(description="AirNote Capture App")
@@ -122,11 +177,13 @@ def main():
     ap.add_argument("--fb_project", type=str, default="", help="Firebase project id")
     ap.add_argument("--fb_bucket", type=str, default="", help="Firebase Storage bucket (e.g. myapp.appspot.com)")
     ap.add_argument("--fb_public", action="store_true", help="Make uploaded files public")
+    ap.add_argument("--autosave_sec", type=float, default=5.0, help="Autosave interval (seconds), >=0 to enable")
     args = ap.parse_args()
     MIRROR_DISPLAY = bool(args.mirror)
     FB_PROJECT = args.fb_project
     FB_BUCKET = args.fb_bucket
     FB_PUBLIC = bool(args.fb_public)
+    AUTOSAVE_MS = max(0, int(args.autosave_sec * 1000))
 
     # Camera
     cap = cv2.VideoCapture(args.cam)
@@ -156,7 +213,7 @@ def main():
     # Mouse fallback
     def on_mouse(event, x, y, flags, param):
         nonlocal tracker, H0, H_curr, board, corners
-        global state, mouse_draw, mouse_down, mouse_pos
+        global state, mouse_draw, mouse_down, mouse_pos, dirty_since_save
         mouse_pos = (x, y)
         if event == cv2.EVENT_LBUTTONDOWN:
             mouse_down = True
@@ -165,9 +222,9 @@ def main():
             elif H_curr is not None and mouse_draw:
                 if state != "DRAW":
                     state = "DRAW"; board.begin(COLORS[color_idx], DRAW_WIDTH, mode="draw")
-                bx, by = warp_point(H_curr, x, y); board.add_point(bx, by)
+                bx, by = warp_point(H_curr, x, y); board.add_point(bx, by); dirty_since_save = True
         elif event == cv2.EVENT_MOUSEMOVE and mouse_down and mouse_draw and H_curr is not None:
-            bx, by = warp_point(H_curr, x, y); board.add_point(bx, by)
+            bx, by = warp_point(H_curr, x, y); board.add_point(bx, by); dirty_since_save = True
         elif event == cv2.EVENT_LBUTTONUP:
             mouse_down = False
             if mouse_draw and state == "DRAW":
@@ -205,6 +262,7 @@ def main():
             tracker.reseed(gray_now, quad=None); set_action("Reseeded")
         if key == ord('r'):
             H0 = None; H_curr = None; corners = []; tracker = None; board = None; state = "IDLE"
+            dirty_since_save = False
 
         # --- Plane selection ---
         if H0 is None:
@@ -234,6 +292,8 @@ def main():
                 )
                 board = BoardCanvas(BOARD_W, BOARD_H)
                 H_curr = H0
+                dirty_since_save = False
+                last_autosave_ms = now_ms()
 
             show = cv2.flip(frame, 1) if MIRROR_DISPLAY else frame
             cv2.imshow("AirNote - Capture", show); continue
@@ -290,64 +350,21 @@ def main():
                         DRAW_WIDTH = min(24, DRAW_WIDTH + 2) if DRAW_WIDTH < 24 else 4
                         set_action(f"Width → {DRAW_WIDTH}")
                     elif sel == "UNDO" and board is not None:
-                        board.undo(); set_action("Undo")
+                        board.undo(); set_action("Undo"); dirty_since_save = True
                     elif sel == "REDO" and board is not None:
-                        board.redo(); set_action("Redo")
+                        board.redo(); set_action("Redo"); dirty_since_save = True
                     elif sel == "CLEAR" and board is not None:
-                        board.clear_page(); set_action("Clear page")
+                        board.clear_page(); set_action("Clear page"); dirty_since_save = True
                     elif sel == "NEW" and board is not None:
-                        board.new_page(); set_action("New page")
+                        board.new_page(); set_action("New page"); dirty_since_save = True
                     elif sel == "SAVE" and board is not None:
                         curr_quad = cv2.perspectiveTransform(np.float32([corners]).reshape(-1,1,2), tracker.H_t).reshape(4,2)
-                        clean_path, json_path, preview_path, meta_path = board.save(
-                            out_root="out",
-                            session_id=session_id,
-                            page_idx=board.page_idx,
-                            H0=H0,
-                            curr_quad=curr_quad,
-                            color_idx=color_idx,
-                            draw_width=DRAW_WIDTH,
-                            hotbar_idx=hotbar_idx,
-                            page_count=board.page_count()
-                        )
-                        set_action("Saved")
-                        save_flash_until = now_ms() + 250
-
-                        # Firebase upload (if configured)
-                        if firebase_uploader is not None:
-                            files = {
-                                "board_png": clean_path,
-                                "board_preview_png": preview_path,
-                                "strokes_json": json_path,
-                                "meta_json": meta_path,
-                            }
-                            meta = {
-                                "W": board.W, "H": board.H,
-                                "page_idx": board.page_idx,
-                                "page_count": board.page_count(),
-                                "color_idx": color_idx,
-                                "draw_width": DRAW_WIDTH,
-                                "hotbar_idx": hotbar_idx,
-                                "H0": H0.tolist() if H0 is not None else None,
-                                "curr_quad": curr_quad.tolist() if curr_quad is not None else None,
-                                "session_id": session_id,
-                            }
-                            save_ts = int(time.time())
-                            try:
-                                res = firebase_uploader.upload_save(
-                                    session_id=session_id,
-                                    save_ts=save_ts,
-                                    files=files,
-                                    meta=meta,
-                                    make_public=FB_PUBLIC,
-                                    extra_fields={"source": "AirNote"}
-                                )
-                                set_action("Saved & uploaded")
-                                print("[Firebase] Uploaded:", res["files"])
-                                print("[Firebase] Doc:", res["firestore_path"])
-                            except Exception as e:
-                                print("[Firebase] upload failed:", e)
-                                set_action("Saved (upload failed)")
+                        ok_save = do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx, firebase_uploader, auto=False)
+                        if ok_save:
+                            set_action("Saved")
+                            save_flash_until = now_ms() + 250
+                            dirty_since_save = False
+                            last_autosave_ms = now_ms()
 
             if tool_pinch and tool_pinch_down_ms > 0:
                 tool_pinch_progress = min(1.0, (now_ms() - tool_pinch_down_ms) / float(SAVE_LONG_MS))
@@ -367,12 +384,28 @@ def main():
                     board.begin(COLORS[color_idx], DRAW_WIDTH, mode=("draw" if tool_mode=="DRAW" else "erase"))
                 if tip is not None:
                     xb, yb = warp_point(H_curr, tip[0], tip[1]); board.add_point(xb, yb)
+                    dirty_since_save = True
             else:
                 if state in ("DRAW","ERASE"):
                     board.end(); state = "IDLE"
         else:
             if state in ("DRAW","ERASE"):
                 board.end(); state = "IDLE"
+
+        # --- Autosave (if enabled) ---
+        if board is not None and AUTOSAVE_MS > 0 and dirty_since_save:
+            if now_ms() - last_autosave_ms >= AUTOSAVE_MS:
+                curr_quad = None
+                try:
+                    if len(corners) == 4 and getattr(tracker, "H_t", None) is not None:
+                        curr_quad = cv2.perspectiveTransform(np.float32([corners]).reshape(-1,1,2), tracker.H_t).reshape(4,2)
+                except Exception:
+                    curr_quad = None
+                ok_save = do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx, firebase_uploader, auto=True)
+                if ok_save:
+                    set_action("Autosaved", ms=750)
+                    dirty_since_save = False
+                    last_autosave_ms = now_ms()
 
         # --- Overlay compose ---
         if board is None or H_curr is None:
@@ -401,7 +434,7 @@ def main():
             cv2.putText(out, last_action_text, (20, h-70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-        # Save flash
+        # Save flash (manual saves only)
         if now_ms() < save_flash_until:
             cv2.rectangle(out, (0,0), (w-1,h-1), (255,255,255), 10)
 
