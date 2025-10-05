@@ -13,6 +13,10 @@ import firebase_admin
 from firebase_admin import credentials, storage
 import os
 
+from fastapi import Body
+import requests
+from io import BytesIO
+
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccount.json")
     firebase_admin.initialize_app(cred, {
@@ -72,6 +76,25 @@ async def label_note(image: UploadFile = File(...)):
         return js
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/label_by_url")
+def label_by_url(payload: dict = Body(...)):
+    url = payload.get("imageURL") or payload.get("url")
+    if not url:
+        return JSONResponse({"error":"imageURL required"}, status_code=400)
+    img_bytes = requests.get(url, timeout=30).content
+    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    resp = model.generate_content([LABEL_PROMPT, img],
+      generation_config={"response_mime_type": "application/json"},
+      request_options={"timeout": 30},
+    )
+    try:
+      return json.loads(resp.text)
+    except Exception:
+      txt = resp.text or ""
+      m1 = re.search(r'"label"\s*:\s*"([^"]+)"', txt)
+      m2 = re.search(r'"summary"\s*:\s*"([^"]+)"', txt)
+      return { "label": m1.group(1) if m1 else "Note", "summary": m2.group(1) if m2 else txt.strip()[:120] }
 
 # ---------- Ingest (image + sidecars) ----------
 @app.post("/ingest_note")
