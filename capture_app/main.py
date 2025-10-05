@@ -410,7 +410,6 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
                 ingest_timestamp_mode="bucket10"  # default; mirrors your curl's %TS:~0,10%
             )
 
-            
 
 
 
