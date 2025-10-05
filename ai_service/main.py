@@ -18,11 +18,6 @@ import requests
 from io import BytesIO
 from typing import List, Dict
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccount.json")
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': os.environ.get("FIREBASE_STORAGE_BUCKET")
-    })
 
 # --- Gemini setup ---
 API_KEY = os.environ.get("GEMINI_API_KEY")

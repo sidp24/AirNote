@@ -373,14 +373,37 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
             }
             save_ts = int(time.time())
             extra = {"source": "AirNote", "auto": bool(auto), "prefix": prefix}
+# after board.save(), where you already have comp_path, json_path, meta_path
             firebase_uploader.upload_save(
                 session_id=session_id,
-                save_ts=save_ts,
-                files=files,
-                meta=meta,
+                save_ts=int(time.time()),
+                files={
+                    "composite_jpg": comp_path,
+                    "strokes_json": json_path,
+                    "meta_json": meta_path,
+                },
+                meta={
+                    "W": board.W,
+                    "H": board.H,
+                    "page_idx": board.page_idx,
+                    "page_count": board.page_count(),
+                    "color_idx": color_idx,
+                    "draw_width": DRAW_WIDTH,
+                    "hotbar_idx": hotbar_idx,
+                    "H0": H0.tolist() if H0 is not None else None,
+                    "curr_quad": curr_quad.tolist() if curr_quad is not None else None,
+                    "session_id": session_id,
+                },
                 make_public=FB_PUBLIC,
-                extra_fields=extra
+                extra_fields={"source": "AirNote", "auto": bool(auto), "prefix": prefix},
+
+                # NEW: local ingestion + Gemini fill
+                ingest_url="http://127.0.0.1:5050/ingest_note",  # "" to skip
+                use_gemini=True,                                  # or False to disable
+                gemini_host="127.0.0.1",
+                gemini_port=8000
             )
+
 
 
         return True

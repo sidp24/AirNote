@@ -188,39 +188,79 @@ def health_check():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
-        # Decode and encode to inline JPEG bytes (most reliable path)
+        # 1) Decode image → JPEG bytes (stable path for inline_data)
         img = _decode_image(req.image_b64_jpg)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=90)
         jpeg_bytes = buf.getvalue()
 
+        # 2) Build the prompt parts (system hint → image → question)
         parts = [
-            {
-                "role": "user",
-                "parts": [
-                    req.system_hint or "",
-                    {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
-                    (req.question or "").strip() or "Be brief.",
-                ],
-            }
+            req.system_hint or "",
+            {"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}},
+            (req.question or "").strip() or "Be brief.",
         ]
 
+        # 3) Generate (don’t use resp.text)
         resp = MODEL.generate_content(
-            contents=parts,
+            contents=[{"role": "user", "parts": parts}],
             generation_config=GENERATION_CONFIG,
             safety_settings=None,
         )
 
-        if not hasattr(resp, "text") or not resp.text:
+        # 4) Safely extract first candidate’s text (no .text access!)
+        def extract_text(r) -> str:
+            try:
+                cands = getattr(r, "candidates", None) or []
+                if not cands:
+                    return ""
+                c0 = cands[0]
+                # Handle safety/finish_reason cases explicitly
+                # (SDK types differ, so use getattr defensively)
+                finish = getattr(c0, "finish_reason", None)
+                if str(finish).lower() in {"safety", "blocked", "recitation", "other"}:
+                    return "(AI) Response blocked by safety filters."
+                content = getattr(c0, "content", None)
+                parts = getattr(content, "parts", None) or []
+                # Concatenate all text parts
+                out = []
+                for p in parts:
+                    # p.text exists for text parts; otherwise skip
+                    t = getattr(p, "text", None)
+                    if t:
+                        out.append(str(t))
+                return " ".join(out).strip()
+            except Exception:
+                return ""
+
+        raw = extract_text(resp)
+        if not raw:
+            # Try to surface safety info if present
+            try:
+                c0 = resp.candidates[0]
+                safety = getattr(c0, "safety_ratings", None)
+                if safety:
+                    # Compact safety reasons
+                    reasons = []
+                    for s in safety:
+                        cat = getattr(s, "category", "unknown")
+                        sev = getattr(s, "probability", getattr(s, "severity", ""))
+                        reasons.append(f"{cat}:{sev}")
+                    msg = " (AI) No answer (safety). " + ", ".join(reasons)
+                    return AskResponse(answer=_hud_safe(_clamp_chars(msg, int(req.max_chars or 360))))
+            except Exception:
+                pass
             return AskResponse(answer="(AI) No answer.")
 
-        text = _single_line(resp.text)
+        # 5) Clamp & HUD-safe
+        text = _single_line(raw)
         text = _clamp_chars(text, int(req.max_chars or 360))
         text = _hud_safe(text)
         return AskResponse(answer=text)
 
     except Exception as e:
-        return AskResponse(answer=f"(AI error) {str(e)[:180]}")
+        # Return a friendly one-liner; avoid long tracebacks in HUD
+        return AskResponse(answer=f"(AI) {str(e)[:180]}")
 
 # ---------------------------
 # Dev server
