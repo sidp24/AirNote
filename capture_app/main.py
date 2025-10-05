@@ -1,4 +1,5 @@
 import argparse, time, uuid
+import threading  # for non-blocking voice → AI flow
 import cv2
 import numpy as np
 
@@ -6,7 +7,10 @@ from hand_state import HandsDetector, parse_hands, fingertip
 from plane_select import draw_reticle, compute_H0
 from tracker import PlanarTracker
 from board_canvas import BoardCanvas, warp_point
-from utils import alpha_blend
+from utils import alpha_blend, roi_gaussian_frosted  # <- frosted HUD panel
+from ai_client import ask_gemini  # <- Gemini client
+from voice_io import record_push_to_talk, transcribe_pcm16, speak
+
 
 # Optional Firebase uploader
 try:
@@ -21,9 +25,13 @@ ERASER_DIAM = 34  # bigger eraser for usability
 COLORS = [(0,255,0),(255,0,0),(0,140,255),(255,255,255)]  # BGR
 
 # Hotbar + gestures
-HOTBAR = ["DRAW", "ERASE", "COLOR", "WIDTH", "UNDO", "REDO", "CLEAR", "NEW", "SAVE"]
+HOTBAR = ["DRAW", "ERASE", "COLOR", "WIDTH", "UNDO", "REDO", "CLEAR", "NEW", "SAVE", "ASK"]
 TOGGLE_TAP_MS = 300
 SAVE_LONG_MS = 700
+PINCH_DEBOUNCE_MS = 200  # minimum ms between recognized pinch rising edges per hand
+TIP_SMOOTH_A = 0.35      # fingertip exponential smoothing (0-1); higher = more responsive
+TEMPORAL_SMOOTH_A = 0.0  # frame-to-frame camera smoothing (0 disables)
+PROGRESS_SMOOTH_A = 0.3  # smoothing for long-press progress ring
 
 # Tracker thresholds
 INLIER_THRESH = 35
@@ -51,6 +59,8 @@ gate_down = False
 last_pinch = {"Left": False, "Right": False}
 pinch_down_ms = {"Left": 0, "Right": 0}
 pinch_progress = 0.0   # render ring for whichever hand is tapping/long-pressing
+last_pinch_rise_ms = {"Left":0, "Right":0}  # for debounce
+pinch_progress_smooth = 0.0
 
 # Feedback HUD
 last_action_text = ""
@@ -79,9 +89,52 @@ PREFIX_AUTO   = "auto"
 
 # Smoothed quad
 smoothed_quad = None
+smoothed_tip = None
+prev_frame_smooth = None
+stroke_primed = False  # ensures first frame after resume doesn't interpolate from old position
+
+# AI HUD state
+ai_text = ""
+ai_text_until = 0
+_frost = roi_gaussian_frosted
+
+# --- Cross-platform key state for 'V' (Windows uses GetAsyncKeyState; else falls back to waitKey) ---
+def _make_is_v_down():
+    try:
+        import sys
+        if sys.platform.startswith("win"):
+            import ctypes
+            user32 = ctypes.windll.user32
+            VK_V = 0x56
+            def is_down():
+                return (user32.GetAsyncKeyState(VK_V) & 0x8000) != 0
+            return is_down
+    except Exception:
+        pass
+    # Fallback: requires OpenCV window focus
+    def is_down():
+        k = cv2.waitKey(1) & 0xFF
+        return k in (ord('v'), ord('V'))
+    return is_down
+
+IS_V_DOWN = _make_is_v_down()
 
 def now_ms(): return int(time.time()*1000)
 
+# --- small helper: build composite once (reuse your do_save logic style) ---
+def build_composite_for_ai(board, frame_bgr, H_curr):
+    try:
+        cam_rect = cv2.warpPerspective(frame_bgr, H_curr, (board.W, board.H))
+        strokes = board._render_to(include_grid=False)  # BGRA
+        sb, sg, sr, sa = cv2.split(strokes)
+        sa_f = sa.astype("float32")/255.0; inv = 1.0 - sa_f
+        comp_b = (sb.astype("float32")*sa_f + cam_rect[:,:,0].astype("float32")*inv).astype("uint8")
+        comp_g = (sg.astype("float32")*sa_f + cam_rect[:,:,1].astype("float32")*inv).astype("uint8")
+        comp_r = (sr.astype("float32")*sa_f + cam_rect[:,:,2].astype("float32")*inv).astype("uint8")
+        return cv2.merge([comp_b, comp_g, comp_r])
+    except Exception:
+        return cv2.cvtColor(board._render_to(include_grid=False), cv2.COLOR_BGRA2BGR)
+    
 def set_action(msg, ms=1000):
     global last_action_text, last_action_until
     last_action_text = msg
@@ -153,8 +206,13 @@ def _icon(img, cx, cy, name, color=(230,230,230)):
     elif name == "SAVE":
         cv2.rectangle(img, (cx-10,cy-8), (cx+10,cy+8), color, 2, cv2.LINE_AA)
         cv2.circle(img, (cx,cy+2), 4, color, 2, cv2.LINE_AA)
+    elif name == "ASK":
+        cv2.circle(img, (cx-6,cy-2), 5, color, 2, cv2.LINE_AA)
+        cv2.line(img, (cx-1,cy-2), (cx+10,cy-2), color, 2, cv2.LINE_AA)
+        cv2.circle(img, (cx+13,cy-2), 3, color, -1, cv2.LINE_AA)
+        cv2.circle(img, (cx-6,cy+9), 2, color, -1, cv2.LINE_AA)
 
-def draw_hotbar(img, w, h, selected_idx, draw_width, color_bgr):
+def draw_hotbar(img, w, h, selected_idx, draw_width, color_bgr, t_sec=0.0):
     margin = 16
     bar_h = 64
     y0 = h - bar_h - margin
@@ -172,19 +230,25 @@ def draw_hotbar(img, w, h, selected_idx, draw_width, color_bgr):
     cell_w = int(inner_w / n)
     y_pad = 6
 
+    pulse = 0.5 + 0.5*np.sin(t_sec*3.5)  # 0..1
     for i, name in enumerate(HOTBAR):
         cx0 = x0 + gap + i*(cell_w + gap)
         cx1 = cx0 + cell_w
         btn_radius = 12
 
         active = (i == selected_idx)
-        base = (60,60,60) if not active else (70,110,70)
+        if active:
+            g = int(60 + 70*pulse)
+            base = (60, g, 60)
+        else:
+            base = (55,55,55)
         _aa_roundrect(img, (cx0, y0+y_pad), (cx1, h - margin - y_pad), btn_radius, base, -1)
 
         if active:
             glow = img.copy()
-            _aa_roundrect(glow, (cx0, y0+y_pad), (cx1, h - margin - y_pad), btn_radius, (80,170,80), -1)
-            cv2.addWeighted(glow, 0.15, img, 0.85, 0, img)
+            glow_col = (90, 190, 90)
+            _aa_roundrect(glow, (cx0, y0+y_pad), (cx1, h - margin - y_pad), btn_radius, glow_col, -1)
+            cv2.addWeighted(glow, 0.18 + 0.07*pulse, img, 1-(0.18+0.07*pulse), 0, img)
 
         cx = (cx0 + cx1)//2
         cy = y0 + y_pad + (bar_h - 2*y_pad)//2 - 6
@@ -208,6 +272,41 @@ def draw_progress_ring(img, center, radius, t01, color=(0,255,255)):
     start_angle = -90
     end_angle = start_angle + int(360 * t01)
     cv2.ellipse(img, center, (radius, radius), 0, start_angle, end_angle, color, 2, lineType=cv2.LINE_AA)
+
+def draw_wrapped_text(img, text, x, y, max_w, line_h=22, color=(255,255,255), scale=0.6, thickness=1):
+    if not text: return y
+    words = text.split()
+    line = ""
+    for w in words:
+        test = (line + " " + w).strip()
+        size,_ = cv2.getTextSize(test, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        if size[0] > max_w and line:
+            cv2.putText(img, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+            y += line_h
+            line = w
+        else:
+            line = test
+    if line:
+        cv2.putText(img, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+        y += line_h
+    return y
+
+# ---------- Geometry helpers ----------
+def auto_square_corners(corners_list):
+    """Return best-fit rectangle corners (tl,tr,br,bl) using minAreaRect if 4 points.
+    Keeps orientation by reordering via sum/diff heuristic."""
+    if len(corners_list) != 4:
+        return corners_list
+    pts = np.array(corners_list, dtype=np.float32)
+    rect = cv2.minAreaRect(pts)
+    box = cv2.boxPoints(rect)
+    # order corners
+    tl = min(box, key=lambda p: p[0]+p[1])
+    br = max(box, key=lambda p: p[0]+p[1])
+    tr = min(box, key=lambda p: -p[0]+p[1])
+    bl = max(box, key=lambda p: -p[0]+p[1])
+    ordered = [tuple(map(int, tl)), tuple(map(int, tr)), tuple(map(int, br)), tuple(map(int, bl))]
+    return ordered
 
 # ---------- Save helper (composite-only) ----------
 def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
@@ -283,13 +382,16 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
         print("[Save] failed:", e)
         return False
 
+# (Removed legacy text prompt + ask helper; replaced by voice-first flow inside gesture handler.)
+
 def main():
     global state, color_idx, DRAW_WIDTH, tool_mode, hotbar_idx
-    global gate_hand, gate_down, last_pinch, pinch_down_ms, pinch_progress
+    global gate_hand, gate_down, last_pinch, pinch_down_ms, pinch_progress, pinch_progress_smooth
     global last_action_text, last_action_until, save_flash_until
     global mouse_draw, mouse_down, mouse_pos
     global firebase_uploader, FB_PROJECT, FB_BUCKET, FB_PUBLIC
-    global AUTOSAVE_MS, last_autosave_ms, dirty_since_save, smoothed_quad
+    global AUTOSAVE_MS, last_autosave_ms, dirty_since_save, smoothed_quad, TIP_SMOOTH_A, TEMPORAL_SMOOTH_A, smoothed_tip, stroke_primed
+    global ai_text, ai_text_until
 
     # CLI
     ap = argparse.ArgumentParser(description="AirNote Capture App")
@@ -301,12 +403,19 @@ def main():
     ap.add_argument("--fb_bucket", type=str, default="")
     ap.add_argument("--fb_public", action="store_true")
     ap.add_argument("--autosave_sec", type=float, default=5.0)
+    ap.add_argument("--no_auto_square", action="store_true", help="Disable auto rectangle correction after 4 corners")
+    ap.add_argument("--tip_smooth", type=float, default=TIP_SMOOTH_A, help="Override fingertip smoothing alpha (0-1)")
+    ap.add_argument("--temporal_smooth", type=float, default=TEMPORAL_SMOOTH_A, help="Temporal frame smoothing alpha (0-1, small blur)")
     args = ap.parse_args()
     MIRROR_DISPLAY = bool(args.mirror)
     FB_PROJECT = args.fb_project
     FB_BUCKET = args.fb_bucket
     FB_PUBLIC = bool(args.fb_public)
     AUTOSAVE_MS = max(0, int(args.autosave_sec * 1000))
+    AUTO_SQUARE = (not args.no_auto_square)
+    # clamp alphas for smoothing parameters
+    TIP_SMOOTH_A = max(0.0, min(1.0, float(args.tip_smooth)))
+    TEMPORAL_SMOOTH_A = max(0.0, min(0.95, float(args.temporal_smooth)))
 
     # Camera
     cap = cv2.VideoCapture(args.cam)
@@ -360,7 +469,7 @@ def main():
 
     # Helper for bi-directional hotbar nav
     def cycle_hotbar(direction):
-        global hotbar_idx, tool_mode, state  # <-- FIXED: use global, not nonlocal
+        global hotbar_idx, tool_mode, state
         n = len(HOTBAR)
         hotbar_idx = (hotbar_idx + direction) % n
         sel = HOTBAR[hotbar_idx]
@@ -376,6 +485,11 @@ def main():
         ok, frame = cap.read()
         if not ok: break
         h, w = frame.shape[:2]
+        # Optional temporal smoothing (simple EMA to mitigate flicker & noise)
+        global prev_frame_smooth
+        if TEMPORAL_SMOOTH_A > 0.0 and prev_frame_smooth is not None:
+            frame = cv2.addWeighted(frame, 1-TEMPORAL_SMOOTH_A, prev_frame_smooth, TEMPORAL_SMOOTH_A, 0)
+        prev_frame_smooth = frame.copy()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # Hands
@@ -406,6 +520,7 @@ def main():
             pinch_down_ms = {"Left": 0, "Right": 0}
             smoothed_quad = None
             dirty_since_save = False
+            ai_text = ""; ai_text_until = 0
 
         # --- Plane selection ---
         if H0 is None:
@@ -421,9 +536,15 @@ def main():
             cv2.putText(frame, f"Place corner {len(corners)+1}/4 (pinch either hand)",
                         (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-            if (pinch["Left"] and not last_pinch["Left"] and len(corners) < 4) or \
-               (pinch["Right"] and not last_pinch["Right"] and len(corners) < 4):
-                corners.append(ret)
+            now = now_ms()
+            # Debounced corner placement: only accept rising edge if sufficient time since last
+            if len(corners) < 4:
+                for hand in ("Left","Right"):
+                    if pinch[hand] and not last_pinch[hand]:
+                        if now - last_pinch_rise_ms[hand] >= PINCH_DEBOUNCE_MS:
+                            corners.append(ret)
+                            last_pinch_rise_ms[hand] = now
+                            break
 
             last_pinch["Left"]  = pinch["Left"]
             last_pinch["Right"] = pinch["Right"]
@@ -433,6 +554,11 @@ def main():
                 cv2.putText(frame, str(i+1), (p[0]+6,p[1]-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,0), 1)
 
             if len(corners) == 4:
+                if AUTO_SQUARE:
+                    sq = auto_square_corners(corners)
+                    if sq and len(sq) == 4:
+                        corners = sq
+                        set_action("Auto-squared")
                 H0, _, _ = compute_H0(corners, BOARD_W, BOARD_H)
                 gray0 = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 tracker = PlanarTracker(
@@ -499,7 +625,11 @@ def main():
         if other is not None and gate_down:
             # rising edge for other hand pinch
             if pinch[other] and not last_pinch[other]:
-                pinch_down_ms[other] = now_ms()
+                # rising edge with debounce
+                tnow = now_ms()
+                if tnow - last_pinch_rise_ms[other] >= PINCH_DEBOUNCE_MS:
+                    pinch_down_ms[other] = tnow
+                    last_pinch_rise_ms[other] = tnow
             # falling edge (decide action)
             if (not pinch[other]) and last_pinch[other] and pinch_down_ms[other] > 0:
                 dur = now_ms() - pinch_down_ms[other]
@@ -536,13 +666,20 @@ def main():
                             save_flash_until = now_ms() + 250
                             dirty_since_save = False
                             last_autosave_ms = now_ms()
+                    elif sel == "ASK" and board is not None and H_curr is not None:
+                        # Non-blocking voice ask now handled by global V key listener each frame.
+                        # Long-press merely arms ASK mode and gives user instruction.
+                        set_action("ASK armed – hold V and speak", ms=1400)
                 pinch_down_ms[other] = 0
 
             # progress ring for long-press
             if pinch[other] and pinch_down_ms[other] > 0:
                 pinch_progress = min(1.0, (now_ms() - pinch_down_ms[other]) / float(SAVE_LONG_MS))
+                # smooth for rendering
+                pinch_progress_smooth = (1-PROGRESS_SMOOTH_A)*pinch_progress_smooth + PROGRESS_SMOOTH_A*pinch_progress
             else:
                 pinch_progress = 0.0
+                pinch_progress_smooth = (1-PROGRESS_SMOOTH_A)*pinch_progress_smooth
 
         # Update last pinch states
         last_pinch["Left"]  = pinch["Left"]
@@ -559,15 +696,27 @@ def main():
                     state = tool_mode
                     width = (ERASER_DIAM if tool_mode == "ERASE" else DRAW_WIDTH)
                     board.begin(COLORS[color_idx], width, mode=("draw" if tool_mode=="DRAW" else "erase"))
+                    # Reset smoothing so we don't drag a line from old stroke location
+                    smoothed_tip = None
+                    stroke_primed = False
                 if tip is not None:
-                    xb, yb = warp_point(H_curr, tip[0], tip[1]); board.add_point(xb, yb)
+                    # fingertip smoothing for steadier strokes
+                    if smoothed_tip is None:
+                        smoothed_tip = np.array(tip, dtype=np.float32)
+                        if not stroke_primed:
+                            xb0, yb0 = warp_point(H_curr, tip[0], tip[1]); board.add_point(xb0, yb0)
+                            stroke_primed = True
+                    else:
+                        smoothed_tip = (1-TIP_SMOOTH_A)*smoothed_tip + TIP_SMOOTH_A*np.array(tip, dtype=np.float32)
+                        tip_use = (int(smoothed_tip[0]), int(smoothed_tip[1]))
+                        xb, yb = warp_point(H_curr, tip_use[0], tip_use[1]); board.add_point(xb, yb)
                     dirty_since_save = True
             else:
                 if state in ("DRAW","ERASE"):
-                    board.end(); state = "IDLE"
+                    board.end(); state = "IDLE"; smoothed_tip = None; stroke_primed = False
         else:
             if state in ("DRAW","ERASE"):
-                board.end(); state = "IDLE"
+                board.end(); state = "IDLE"; smoothed_tip = None; stroke_primed = False
 
         # --- Autosave (if enabled) ---
         if board is not None and AUTOSAVE_MS > 0 and dirty_since_save:
@@ -579,6 +728,62 @@ def main():
                     set_action("Autosaved", ms=750)
                     dirty_since_save = False
                     last_autosave_ms = now_ms()
+
+        # --- Voice / AI Flow (non-blocking push-to-talk) ---
+        # Trigger only when ASK hotbar item is selected.
+        if HOTBAR[hotbar_idx] == "ASK" and board is not None and H_curr is not None:
+            is_v_down = IS_V_DOWN()
+            # Rising edge: start listening thread
+            if is_v_down and state != "ASK_VOICE_LISTENING":
+                print("[Voice] PTT down. Starting listen loop…")
+                state = "ASK_VOICE_LISTENING"
+                # Capture composite & H snapshot for thread (avoid mutation issues)
+                composite_for_ai = build_composite_for_ai(board, frame, H_curr)
+
+                def _ask_thread_target(comp_img, H_snapshot):
+                    global ai_text, ai_text_until, state
+                    try:
+                        print("[Voice Thread] Starting recording…")
+                        pcm_bytes, sr_local = record_push_to_talk(IS_V_DOWN, start_timeout_sec=0.1)
+                        if not pcm_bytes:
+                            ai_text = "(AI) No audio captured."; ai_text_until = now_ms() + 2500
+                            speak(ai_text)
+                            return
+                        ai_text = "(AI) Transcribing…"; ai_text_until = now_ms() + 10000
+                        question = transcribe_pcm16(pcm_bytes, sr_local).strip()
+                        print(f"[Voice Thread] Transcription: '{question}'")
+                        if not question:
+                            ai_text = "(AI) Didn't catch that."; ai_text_until = now_ms() + 2200
+                            speak(ai_text)
+                            return
+                        ai_text = f"(AI) Thinking: {question[:60]}"; ai_text_until = now_ms() + 12000
+                        system_hint = (
+                            "You are a vision-based assistant answering the user's question about the image. "
+                            "Answer directly; be concise unless elaboration is requested."
+                        )
+                        answer = ask_gemini(
+                            comp_img,
+                            question,
+                            system_hint=system_hint,
+                            max_chars=600,
+                        )
+
+                        ai_text = answer or "(AI) No answer."; ai_text_until = now_ms() + 10000
+                        if answer:
+                            try: speak(answer)
+                            except Exception: pass
+                        print(f"[AI Thread] Answer: {answer}")
+                    except Exception as e:
+                        err = f"(AI Thread Error) {str(e)[:100]}"; print(err)
+                        ai_text = err; ai_text_until = now_ms() + 3500
+                    finally:
+                        state = "IDLE"
+
+                threading.Thread(target=_ask_thread_target, args=(composite_for_ai, H_curr), daemon=True).start()
+
+            # Falling edge: show processing toast (thread will reset state when done)
+            if (not is_v_down) and state == "ASK_VOICE_LISTENING":
+                set_action("AI: Processing voice & image…", ms=1500)
 
         # --- Overlay compose ---
         if board is None or H_curr is None:
@@ -613,10 +818,29 @@ def main():
         # Progress ring over the OTHER hand fingertip (if any)
         tip_for_ring = tip_left if (gate_hand=="Right") else (tip_right if gate_hand=="Left" else None)
         if tip_for_ring is not None and pinch_progress > 0:
-            draw_progress_ring(out, (tip_for_ring[0], tip_for_ring[1]), 16, pinch_progress, color=(0,200,255))
+            draw_progress_ring(out, (tip_for_ring[0], tip_for_ring[1]), 16, pinch_progress_smooth, color=(0,200,255))
 
         # Modern bottom hotbar
-        draw_hotbar(out, w, h, hotbar_idx, DRAW_WIDTH, COLORS[color_idx])
+        draw_hotbar(out, w, h, hotbar_idx, DRAW_WIDTH, COLORS[color_idx], t_sec=time.time())
+
+        # --- AI pill (top-right) ---
+        if now_ms() < ai_text_until and ai_text:
+            pad = 14
+            box_w = min(520, w - 2*pad)
+            x0, y0 = w - box_w - pad, pad
+            try:
+                _frost(out, x0, y0, x0+box_w, y0+72, alpha=0.78, ksize=19)
+            except Exception:
+                cv2.rectangle(out, (x0,y0), (x0+box_w,y0+72), (32,32,32), -1)
+            cv2.rectangle(out, (x0,y0), (x0+box_w,y0+72), (60,60,60), 1, cv2.LINE_AA)
+            cv2.putText(out, "Gemini", (x0+14, y0+26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2, cv2.LINE_AA)
+            txt = ai_text.strip().replace("\n", " ")
+            (tw,th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            maxw = box_w - 28
+            while tw > maxw and len(txt) > 4:
+                txt = txt[:-2] + "…"
+                (tw,th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.putText(out, txt, (x0+14, y0+48), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240,240,240), 2, cv2.LINE_AA)
 
         # Small rectified preview (top-left)
         try:
@@ -634,3 +858,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ------------------------------
+# Future improvements (TODO):
+# 1. Replace fingertip EMA with per-axis 1€ filter (better dynamic smoothing).
+# 2. Implement Kalman filter over homography for predictive tracking under occlusion.
+# 3. Adaptive reseed based on spatial feature dispersion + motion magnitude.
+# 4. Multi-scale ORB/FAST mix to stabilize at varying distances.
+# 5. Optional GPU path for warps & blending for higher FPS on large boards.
+# 6. Gesture classifier (e.g., circle for undo) to reduce hotbar dependency on small screens.
+# 7. Push-to-talk: stream mic → /ask with STT, auto-fill question.
+# ------------------------------

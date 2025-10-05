@@ -1,8 +1,33 @@
-numpy==1.26.4
-opencv-python==4.8.1.78
-mediapipe==1.3.0
+# Core
+opencv-python
+numpy
 
-# Optional / helper packages
-tqdm==4.66.1
-pyyaml==6.0
-wheel==0.40.0
+# Hands tracking
+mediapipe
+
+# FastAPI service
+fastapi
+uvicorn
+pydantic
+Pillow
+python-dotenv
+
+# Gemini client (Google GenAI)
+google-generativeai
+requests
+
+# Audio IO + STT + TTS
+sounddevice
+numpy   # (already above, listed again ok)
+pyttsx3
+
+# Choose ONE STT stack (or both):
+faster-whisper        # preferred (requires ffmpeg installed on system)
+# whisper             # alternative (openai-whisper; heavier, needs torch)
+# torch               # only if using openai-whisper on CPU/GPU
+
+# Optional Firebase
+firebase-admin
+# google-cloud-storage   # only if you use GCS client directly
+google-generativeai
+pydantic # Needed for the Pydantic schemas
