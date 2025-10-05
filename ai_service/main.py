@@ -16,6 +16,7 @@ import os
 from fastapi import Body
 import requests
 from io import BytesIO
+from typing import List, Dict
 
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccount.json")
@@ -146,6 +147,139 @@ async def ingest_note(
         return {"ok": True, "id": doc_id, "imageURL": image_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- Build a simple similarity graph (Obsidian-style) ----------
+@app.post("/rebuild_graph")
+def rebuild_graph():
+    """
+    Build a lightweight note graph from Firestore and store it at graphs/latest.
+    Similarity is computed from AI tags + label/type if available.
+    """
+    # 1) Pull all notes
+    notes_ref = db.collection("notes")
+    docs = list(notes_ref.stream())
+
+    notes: List[Dict] = []
+    for d in docs:
+        data = d.to_dict() or {}
+        ai = data.get("ai") or {}
+        tags = ai.get("tags") or []
+        note = {
+            "id": d.id,
+            "title": data.get("title") or f"Note {d.id}",
+            "label": data.get("label") or None,        # optional plain label
+            "type": ai.get("type") or None,            # ai-assigned type
+            "tags": tags,                               # ai-assigned tags (array)
+            "timestamp": data.get("timestamp") or 0,
+            "sessionId": data.get("sessionId") or None # used for graph similarity
+        }
+        notes.append(note)
+
+    # 2) Nodes (clusterId falls back to label, then type, then 'unlabeled')
+    nodes = []
+    for n in notes:
+        cluster = n.get("label") or n.get("type") or "unlabeled"
+        nodes.append({
+            "id": n["id"],
+            "label": n.get("title") or n["id"],
+            "clusterId": cluster,
+        })
+
+    # 3) Edges: tag overlap + same label/type
+    def sim(a: Dict, b: Dict) -> float:
+        at = set(a.get("tags") or [])
+        bt = set(b.get("tags") or [])
+        tag_overlap = len(at & bt)
+        same_label = 1.0 if a.get("label") and a.get("label") == b.get("label") else 0.0
+        same_type  = 0.5 if a.get("type")  and a.get("type")  == b.get("type")  else 0.0
+        same_session = 0.25 if a.get("sessionId") and a.get("sessionId") == b.get("sessionId") else 0.0
+        return float(tag_overlap + same_label + same_type + same_session)
+
+    edges = []
+    for i in range(len(notes)):
+        for j in range(i + 1, len(notes)):
+            w = sim(notes[i], notes[j])
+            if w > 0:
+                edges.append({"s": notes[i]["id"], "t": notes[j]["id"], "w": w})
+
+    # 3b) Time adjacency: connect consecutive notes taken within 5 minutes
+    notes_sorted = sorted(notes, key=lambda n: n.get("timestamp") or 0)
+    for i in range(len(notes_sorted) - 1):
+        a, b = notes_sorted[i], notes_sorted[i + 1]
+        ta = a.get("timestamp") or 0
+        tb = b.get("timestamp") or 0
+        if abs(tb - ta) <= 5 * 60:
+            edges.append({"s": a["id"], "t": b["id"], "w": 0.2})
+
+    graph_doc = {
+        "updatedAt": int(time.time()),
+        "params": {"k": 0, "simThreshold": 0.0},
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+    db.collection("graphs").document("latest").set(graph_doc)
+    return {"nodes": len(nodes), "edges": len(edges)}
+
+# ---------- Backfill AI labels for existing notes by imageURL ----------
+@app.post("/backfill_analyze")
+def backfill_analyze():
+    """
+    For notes missing 'ai' field, call Gemini on imageURL and store ai.summary/type/tags/entities.
+    Useful for older notes created before AI-labeling was added.
+    """
+    missing = []
+    notes_ref = db.collection("notes")
+    docs = list(notes_ref.stream())
+
+    updated = 0
+    for d in docs:
+        data = d.to_dict() or {}
+        if data.get("ai"):
+            continue
+        url = data.get("imageURL") or data.get("imageUrl")
+        if not url:
+            continue
+
+        try:
+            img_bytes = requests.get(url, timeout=30).content
+            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+            resp = model.generate_content(
+                [LABEL_PROMPT, img],
+                generation_config={"response_mime_type": "application/json"},
+                request_options={"timeout": 30},
+            )
+            try:
+                js = json.loads(resp.text)
+            except Exception:
+                txt = resp.text or ""
+                m1 = re.search(r'"label"\s*:\s*"([^"]+)"', txt)
+                m2 = re.search(r'"summary"\s*:\s*"([^"]+)"', txt)
+                js = {
+                    "label": m1.group(1) if m1 else "Note",
+                    "summary": m2.group(1) if m2 else txt.strip()[:120],
+                }
+
+            ai_payload = {
+                "summary": js.get("summary") or "",
+                "type": js.get("type") or "other",
+                "tags": js.get("tags") or [],
+                "entities": js.get("entities") or [],
+            }
+
+            payload = {
+                "ai": ai_payload,
+                "tags": ai_payload["tags"],              
+                "content": ai_payload["summary"],      
+                "updatedAt": int(time.time()),          
+            }
+
+            db.collection("notes").document(d.id).set(payload, merge=True)
+            updated += 1
+        except Exception as exc:
+            missing.append({"id": d.id, "error": str(exc)})
+
+    return {"updated": updated, "errors": missing}
 # ---------- Debugging endpoint ----------
 @app.get("/_fb_debug")
 def fb_debug():

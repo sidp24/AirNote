@@ -4,6 +4,7 @@ import { createBrowserRouter, RouterProvider, Outlet, Link } from "react-router-
 import Dashboard from "./pages/Dashboard";
 import Alive from "./pages/Alive";
 import Note from "./pages/Note";
+import Graph from "./pages/Graph";
 import "./index.css";
 import { Sparkles } from "lucide-react";
 
@@ -19,6 +20,7 @@ function Shell() {
           <nav className="ml-auto flex items-center gap-2">
             <Link to="/" className="btn">Notes</Link>
             <Link to="/alive" className="btn-accent">Alive</Link>
+            <Link to="/graph" className="btn">Vault Graph</Link> {}
           </nav>
         </div>
       </header>
@@ -30,11 +32,16 @@ function Shell() {
 }
 
 const router = createBrowserRouter([
-  { path: "/", element: <Shell />, children: [
+  {
+    path: "/",
+    element: <Shell />,
+    children: [
       { index: true, element: <Dashboard /> },
       { path: "alive", element: <Alive /> },
       { path: "note/:id", element: <Note /> },
-  ]},
+      { path: "graph", element: <Graph /> }, 
+    ],
+  },
 ]);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

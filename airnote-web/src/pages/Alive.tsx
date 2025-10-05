@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import type { Note } from "../types";
-import { fetchNotes, saveLabel } from "../lib/notes";
-
 const BE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:5050";
+
+type NoteItem = {
+  id: string;
+  title?: string;
+  imageURL?: string;
+  label?: string;
+  summary?: string;
+};
+
+import { subscribeNotes, saveLabel } from "../lib/notes";
 
 async function labelByUrl(imageURL: string) {
   const r = await fetch(`${BE}/label_by_url`, {
@@ -16,22 +23,25 @@ async function labelByUrl(imageURL: string) {
 }
 
 export default function Alive() {
-  const [notes, setNotes] = useState<Note[]>([]);
+  const [notes, setNotes] = useState<NoteItem[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
 
-  useEffect(() => { fetchNotes().then(setNotes); }, []);
+  useEffect(() => {
+    const unsub = subscribeNotes((ns) => setNotes(ns as unknown as NoteItem[]));
+    return () => unsub();
+  }, []);
 
   const groups = useMemo(() => {
-    const m = new Map<string, Note[]>();
+    const m = new Map<string, NoteItem[]>();
     for (const n of notes) m.set(n.label || "Unlabeled", [...(m.get(n.label || "Unlabeled") || []), n]);
     return Array.from(m.entries());
   }, [notes]);
 
-  async function doLabel(n: Note) {
+  async function doLabel(n: NoteItem) {
     try {
       setBusy(n.id);
-      const { label, summary } = await labelByUrl(n.imageURL);
-      await saveLabel(n.id, label, summary);
+      const { label, summary } = await labelByUrl(n.imageURL || "");
+      await saveLabel(n.id, label);
       setNotes(prev => prev.map(p => p.id === n.id ? { ...p, label, summary } : p));
     } finally {
       setBusy(null);
