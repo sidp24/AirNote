@@ -7,7 +7,7 @@
 * Redefining Note-Taking: Think Freely, Write Anywhere, Learn Intuitively
 * AI-Powered Note Graph and Recognition System || Bringing Augmented Reality Note-Taking to Life
 
-## Insperation
+## Inspiration
 
 The idea for AirNote stemmed from the increasing popularity of AR glasses and spatial computing. We were inspired by the future of intelligent interfaces and how they can help people process information faster. As **Mark Zuckerberg** said,  
 > “People without smart glasses may one day be at a significant cognitive disadvantage compared to those who do use the tech.”
@@ -21,19 +21,11 @@ Our system takes handwritten screenshots or AR overlays, merges them into a sing
 
 Every note is represented as a node connected by semantic similarity, helping users visually explore how their ideas relate. Users can label notes, view AI-generated summaries, and delete or update them dynamically — all through a modern, intuitive interface.
 
-### Dependencies
-
-* Python 3.12.7+  
-* Node.js 18+  
-* Firebase  
-* FastAPI  
-* React + Vite
-
 ### What it does
 
 AirNote takes handwritten or AR-based note screenshots, analyzes them with Gemini, and generates structured labels and summaries.  
 These notes are stored in Firebase Firestore and visualized in an interactive Vault Graph that dynamically connects related ideas based on embedding similarity.  
-Users can explore, label, or delete notes directly from the dashboard while the backend ensures real-time synchronization.
+Users can explore, label, or delete your notes directly from the dashboard while the backend ensures real-time synchronization.
 
 ## Collaborator
 
@@ -51,3 +43,11 @@ Users can explore, label, or delete notes directly from the dashboard while the 
 * typescript  
 * opencv  
 * mediapipe
+
+### Dependencies
+
+* Python 3.12.7+  
+* Node.js 18+  
+* Firebase  
+* FastAPI  
+* React + Vite
