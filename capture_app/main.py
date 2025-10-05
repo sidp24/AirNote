@@ -77,6 +77,10 @@ firebase_uploader = None
 FB_PROJECT = ""
 FB_BUCKET = ""
 FB_PUBLIC = False
+FB_PREFIX = "snapshots"
+FB_FS_ROOT = "sessions"
+FB_FS_SUBCOL = "saves"   # <--- add this
+
 
 # Autosave
 AUTOSAVE_MS = 5000
@@ -377,6 +381,8 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
                 make_public=FB_PUBLIC,
                 extra_fields=extra
             )
+
+
         return True
     except Exception as e:
         print("[Save] failed:", e)
@@ -389,32 +395,70 @@ def main():
     global gate_hand, gate_down, last_pinch, pinch_down_ms, pinch_progress, pinch_progress_smooth
     global last_action_text, last_action_until, save_flash_until
     global mouse_draw, mouse_down, mouse_pos
-    global firebase_uploader, FB_PROJECT, FB_BUCKET, FB_PUBLIC
+    global firebase_uploader, FB_PROJECT, FB_BUCKET, FB_PUBLIC, FB_PREFIX, FB_FS_ROOT, FB_FS_SUBCOL
     global AUTOSAVE_MS, last_autosave_ms, dirty_since_save, smoothed_quad, TIP_SMOOTH_A, TEMPORAL_SMOOTH_A, smoothed_tip, stroke_primed
     global ai_text, ai_text_until
 
     # CLI
+    # ap = argparse.ArgumentParser(description="AirNote Capture App")
+    # ap.add_argument("--cam", type=int, default=0)
+    # ap.add_argument("--mirror", action="store_true")
+    # ap.add_argument("--width", type=int, default=1280)
+    # ap.add_argument("--height", type=int, default=720)
+    # ap.add_argument("--fb_project", type=str, default="")
+    # ap.add_argument("--fb_bucket", type=str, default="")
+    # ap.add_argument("--fb_public", action="store_true")
+    # ap.add_argument("--fb_prefix", type=str, default="snapshots",
+    #                 help="Storage object prefix (folder-like), e.g., 'Airnote'")
+    # ap.add_argument("--fb_fs_root", type=str, default="sessions",
+    #                 help="Firestore root collection, e.g., 'Airnote'")
+    # ap.add_argument("--autosave_sec", type=float, default=5.0)
+    # ap.add_argument("--no_auto_square", action="store_true", help="Disable auto rectangle correction after 4 corners")
+    # ap.add_argument("--tip_smooth", type=float, default=TIP_SMOOTH_A, help="Override fingertip smoothing alpha (0-1)")
+    # ap.add_argument("--temporal_smooth", type=float, default=TEMPORAL_SMOOTH_A, help="Temporal frame smoothing alpha (0-1, small blur)")
+    # ap.add_argument("--fb_fs_subcol", type=str, default="saves",
+    #             help="Firestore subcollection under each session doc, e.g., 'notes'")
+
     ap = argparse.ArgumentParser(description="AirNote Capture App")
     ap.add_argument("--cam", type=int, default=0)
     ap.add_argument("--mirror", action="store_true")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
+
+    # Firebase flags
     ap.add_argument("--fb_project", type=str, default="")
     ap.add_argument("--fb_bucket", type=str, default="")
     ap.add_argument("--fb_public", action="store_true")
+
+    # Where to store in GCS and Firestore
+    ap.add_argument("--fb_prefix",   type=str, default="snapshots",
+                    help="Cloud Storage prefix (folder-like), e.g., 'notes'")
+    ap.add_argument("--fb_fs_root",  type=str, default="sessions",
+                    help="Firestore root collection, e.g., 'Airnote'")
+    ap.add_argument("--fb_fs_subcol", type=str, default="saves",
+                    help="Firestore subcollection under each session doc, e.g., 'notes'")
+
     ap.add_argument("--autosave_sec", type=float, default=5.0)
-    ap.add_argument("--no_auto_square", action="store_true", help="Disable auto rectangle correction after 4 corners")
-    ap.add_argument("--tip_smooth", type=float, default=TIP_SMOOTH_A, help="Override fingertip smoothing alpha (0-1)")
-    ap.add_argument("--temporal_smooth", type=float, default=TEMPORAL_SMOOTH_A, help="Temporal frame smoothing alpha (0-1, small blur)")
+    ap.add_argument("--no_auto_square", action="store_true",
+                    help="Disable auto rectangle correction after 4 corners")
+    ap.add_argument("--tip_smooth", type=float, default=TIP_SMOOTH_A,
+                    help="Override fingertip smoothing alpha (0-1)")
+    ap.add_argument("--temporal_smooth", type=float, default=TEMPORAL_SMOOTH_A,
+                    help="Temporal frame smoothing alpha (0-1, small blur)")
+
     args = ap.parse_args()
+
     MIRROR_DISPLAY = bool(args.mirror)
-    FB_PROJECT = args.fb_project
-    FB_BUCKET = args.fb_bucket
-    FB_PUBLIC = bool(args.fb_public)
-    AUTOSAVE_MS = max(0, int(args.autosave_sec * 1000))
-    AUTO_SQUARE = (not args.no_auto_square)
-    # clamp alphas for smoothing parameters
-    TIP_SMOOTH_A = max(0.0, min(1.0, float(args.tip_smooth)))
+    FB_PROJECT     = args.fb_project
+    FB_BUCKET      = args.fb_bucket
+    FB_PUBLIC      = bool(args.fb_public)
+    FB_PREFIX      = args.fb_prefix
+    FB_FS_ROOT     = args.fb_fs_root
+    FB_FS_SUBCOL   = args.fb_fs_subcol
+    AUTOSAVE_MS    = max(0, int(args.autosave_sec * 1000))
+    AUTO_SQUARE    = (not args.no_auto_square)
+    # clamp alphas
+    TIP_SMOOTH_A      = max(0.0, min(1.0, float(args.tip_smooth)))
     TEMPORAL_SMOOTH_A = max(0.0, min(0.95, float(args.temporal_smooth)))
 
     # Camera
@@ -436,7 +480,15 @@ def main():
     # Firebase (lazy) init
     if FB_PROJECT and FB_BUCKET and FirebaseUploader is not None:
         try:
-            firebase_uploader = FirebaseUploader(project_id=FB_PROJECT, bucket_name=FB_BUCKET)
+# main.py — Firebase init
+            firebase_uploader = FirebaseUploader(
+                project_id=FB_PROJECT,
+                bucket_name=FB_BUCKET,
+                storage_prefix=FB_PREFIX,  # e.g., "notes"
+                fs_root=FB_FS_ROOT,        # e.g., "Airnote"
+                fs_subcol=FB_FS_SUBCOL     # e.g., "notes"
+            )
+
             print("[Firebase] Initialized")
         except Exception as e:
             print("[Firebase] init failed:", e)
@@ -659,8 +711,11 @@ def main():
                         board.new_page(); set_action("New page"); dirty_since_save = True
                     elif sel == "SAVE" and board is not None:
                         curr_quad = smoothed_quad if smoothed_quad is not None else None
-                        ok_save = do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
-                                          firebase_uploader, frame, H_curr, auto=False)
+                        ok_save = do_save(
+                                board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
+                                firebase_uploader, frame, H_curr, auto=False
+                    )
+
                         if ok_save:
                             set_action("Saved")
                             save_flash_until = now_ms() + 250

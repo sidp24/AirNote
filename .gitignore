@@ -144,3 +144,6 @@ serviceAccount.json
 
 # Keep README tracked
 !README.md
+serviceAccountKey.json
+*.json
+capture_app/out/*
