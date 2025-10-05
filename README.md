@@ -1,6 +1,6 @@
 # AIRNOTE
 
-## The World is YOUR Notebook
+## The World is YOUR Notebook...
 
 ### Major League Hacking — Rutgers University Hackathon
 
