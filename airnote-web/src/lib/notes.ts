@@ -11,7 +11,6 @@ import {
   setDoc,
   deleteDoc,
 } from "firebase/firestore";
-import type { DocumentData } from "firebase/firestore";
 import { db } from "../firebase";
 import { storage } from "../firebase";
 import { ref as storageRef, deleteObject } from "firebase/storage";
