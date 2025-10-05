@@ -6,11 +6,12 @@ type NoteItem = {
   id: string;
   title?: string;
   imageURL?: string;
+  imageUrl?: string; // legacy/alternate key
   label?: string;
   summary?: string;
 };
 
-import { subscribeNotes, saveLabel } from "../lib/notes";
+import { subscribeNotes, saveLabelAndSummary } from "../lib/notes";
 
 async function labelByUrl(imageURL: string) {
   const r = await fetch(`${BE}/label_by_url`, {
@@ -40,8 +41,9 @@ export default function Alive() {
   async function doLabel(n: NoteItem) {
     try {
       setBusy(n.id);
-      const { label, summary } = await labelByUrl(n.imageURL || "");
-      await saveLabel(n.id, label);
+      const img = n.imageURL || n.imageUrl || "";
+      const { label, summary } = await labelByUrl(img);
+      await saveLabelAndSummary(n.id, label, summary);
       setNotes(prev => prev.map(p => p.id === n.id ? { ...p, label, summary } : p));
     } finally {
       setBusy(null);
@@ -63,7 +65,7 @@ export default function Alive() {
           <div className="flex flex-wrap gap-4">
             {list.map(n => (
               <div key={n.id} className="glass p-2 pr-3 flex items-center gap-3">
-                <img src={n.imageURL} className="w-16 h-11 object-cover rounded-lg border border-[var(--border)]" />
+                <img src={n.imageURL || n.imageUrl} className="w-16 h-11 object-cover rounded-lg border border-[var(--border)]" />
                 <div className="w-56">
                   <div className="text-sm font-semibold truncate">{n.title || n.id}</div>
                   <div className="text-xs text-[var(--muted)] truncate">{n.summary || "—"}</div>

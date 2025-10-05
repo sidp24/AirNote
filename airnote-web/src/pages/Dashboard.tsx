@@ -4,10 +4,29 @@ import { motion } from "framer-motion";
 import { subscribeNotes } from "../lib/notes";
 import type { NoteDoc } from "../types";
 import { Search } from "lucide-react";
+import { Trash2 } from "lucide-react";
+import { deleteNote } from "../lib/notes";
 
 export default function Dashboard() {
   const [notes, setNotes] = useState<NoteDoc[]>([]);
   const [q, setQ] = useState("");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  async function handleDeleteCard(n: any) {
+    const ok = window.confirm("Delete this note? This cannot be undone.");
+    if (!ok) return;
+    try {
+      setDeletingId(n.id);
+      await deleteNote(n.id, (n as any).imageURL || (n as any).imageUrl);
+      // Optimistic removal; subscription will also update
+      setNotes((prev) => prev.filter((p) => p.id !== n.id));
+    } catch (e) {
+      console.error(e);
+      alert("Failed to delete note. Check console for details.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   useEffect(() => {
     const unsub = subscribeNotes((ns) => setNotes(ns as NoteDoc[]));
@@ -16,11 +35,17 @@ export default function Dashboard() {
 
   const filtered = useMemo(() => {
     const t = q.toLowerCase();
-    return notes.filter(n =>
-      (n.title || "").toLowerCase().includes(t) ||
-      (n.tags?.join(", ") || "").toLowerCase().includes(t) ||
-      (n.content || "").toLowerCase().includes(t)
-    );
+    return notes.filter((n) => {
+      const hay = [
+        n.title || "",
+        n.tags?.join(", ") || "",
+        n.content || "",
+        (n as any).ai?.summary || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(t);
+    });
   }, [notes, q]);
 
   const displayLabel = (n: NoteDoc) => {
@@ -57,7 +82,21 @@ export default function Dashboard() {
             transition={{ delay: idx * 0.04, type: "spring", stiffness: 120, damping: 18 }}
             className="animate-[fadeInUp_.55s_ease_forwards] opacity-0 translate-y-3"
           >
-            <Link to={`/note/${n.id}`} className="card block group hover:shadow-lg transition-shadow">
+            <Link to={`/note/${n.id}`} className="card block group hover:shadow-lg transition-shadow relative">
+              {/* Delete button */}
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleDeleteCard(n);
+                }}
+                className="absolute right-2 top-2 z-10 inline-flex items-center gap-1 rounded-md border border-[var(--border)] bg-black/50 px-2 py-1 text-xs hover:bg-black/60"
+                disabled={deletingId === n.id}
+                title="Delete"
+              >
+                <Trash2 className="size-3.5" />
+                {deletingId === n.id ? "Deleting…" : "Delete"}
+              </button>
               <div className="aspect-[16/9] overflow-hidden rounded-t-xl bg-black/20">
                 {(() => {
                   const img: string | undefined =
@@ -90,7 +129,11 @@ export default function Dashboard() {
                     );
                   })()}
                 </div>
-                {n.content && <div className="text-sm text-white/80 line-clamp-2">{n.content}</div>}
+                {(((n as any).ai?.summary) || n.content) && (
+                  <div className="text-sm text-white/80 line-clamp-2">
+                    {(n as any).ai?.summary || n.content}
+                  </div>
+                )}
                 <div className="text-xs text-[var(--muted)]">
                   Created: {n.createdAt ? new Date(n.createdAt * 1000).toLocaleString() : "N/A"}<br />
                   Updated: {n.updatedAt ? new Date(n.updatedAt * 1000).toLocaleString() : "—"}
