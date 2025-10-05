@@ -1,33 +1,56 @@
-# Core
-opencv-python
-numpy
+# ---- Core ----
+numpy==2.2.6
+opencv-python==4.12.0.88
+opencv-contrib-python==4.12.0.88
+Pillow==11.3.0
+matplotlib==3.10.6
 
-# Hands tracking
-mediapipe
+# ---- Hand tracking (MediaPipe) and its JAX deps ----
+mediapipe==0.10.14
+jax==0.7.2
+jaxlib==0.7.2
+protobuf==4.25.8
 
-# FastAPI service
-fastapi
-uvicorn
-pydantic
-Pillow
-python-dotenv
+# ---- App server & config ----
+fastapi==0.118.0
+uvicorn==0.37.0
+pydantic==2.11.10
+starlette==0.48.0
+python-dotenv==1.1.1
 
-# Gemini client (Google GenAI)
-google-generativeai
-requests
+# ---- Audio I/O & TTS (Windows) ----
+sounddevice==0.5.2
+pyttsx3==2.99
+pywin32==311
+pypiwin32==223
+comtypes==1.4.12
+CFFI==2.0.0
 
-# Audio IO + STT + TTS
-sounddevice
-numpy   # (already above, listed again ok)
-pyttsx3
+# ---- Whisper (local speech-to-text) ----
+faster-whisper==1.2.0
+ctranslate2==4.6.0
+onnxruntime==1.23.0
+tokenizers==0.22.1
+av==15.1.0
 
-# Choose ONE STT stack (or both):
-faster-whisper        # preferred (requires ffmpeg installed on system)
-# whisper             # alternative (openai-whisper; heavier, needs torch)
-# torch               # only if using openai-whisper on CPU/GPU
+# ---- Google Generative AI stack ----
+google-generativeai==0.8.5
+google-ai-generativelanguage==0.6.15
+google-api-python-client==2.184.0
+google-auth==2.41.1
+google-auth-httplib2==0.2.0
+google-api-core==2.25.2
+googleapis-common-protos==1.70.0
+grpcio==1.75.1
+grpcio-status==1.62.3
 
-# Optional Firebase
-firebase-admin
-# google-cloud-storage   # only if you use GCS client directly
-google-generativeai
-pydantic # Needed for the Pydantic schemas
+# ---- Firebase Admin SDK ----
+firebase-admin==7.1.0
+google-cloud-firestore==2.21.0
+google-cloud-storage==3.4.0
+httpx[http2]==0.28.1
+cachecontrol==0.14.3
+
+# ---- Utils ----
+requests==2.32.5
+tqdm==4.67.1

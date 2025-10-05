@@ -49,6 +49,9 @@ state = "IDLE"         # IDLE, DRAW, ERASE
 _last_t = None
 fps = 0.0
 
+
+ingest_timestamp_mode="epoch"
+
 # Hands UX
 tool_mode = "DRAW"     # "DRAW" or "ERASE"
 hotbar_idx = 0
@@ -378,13 +381,12 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
                 session_id=session_id,
                 save_ts=int(time.time()),
                 files={
-                    "composite_jpg": comp_path,
+                    "composite_jpg": comp_path,   # whatever board.save wrote; we’ll re-encode to PNG for POST
                     "strokes_json": json_path,
                     "meta_json": meta_path,
                 },
                 meta={
-                    "W": board.W,
-                    "H": board.H,
+                    "W": board.W, "H": board.H,
                     "page_idx": board.page_idx,
                     "page_count": board.page_count(),
                     "color_idx": color_idx,
@@ -393,16 +395,23 @@ def do_save(board, session_id, H0, curr_quad, color_idx, DRAW_WIDTH, hotbar_idx,
                     "H0": H0.tolist() if H0 is not None else None,
                     "curr_quad": curr_quad.tolist() if curr_quad is not None else None,
                     "session_id": session_id,
+                    
                 },
                 make_public=FB_PUBLIC,
                 extra_fields={"source": "AirNote", "auto": bool(auto), "prefix": prefix},
 
-                # NEW: local ingestion + Gemini fill
-                ingest_url="http://127.0.0.1:5050/ingest_note",  # "" to skip
-                use_gemini=True,                                  # or False to disable
+                # local ingest EXACTLY like curl
+                ingest_url="http://127.0.0.1:5050/ingest_note",
+                use_gemini=False,           # not needed for strict curl parity
                 gemini_host="127.0.0.1",
-                gemini_port=8000
+                gemini_port=8000,
+                ingest_minimal=True,        # <-- IMPORTANT
+                ingest_force_png=True,       # <-- IMPORTANT
+                ingest_timestamp_mode="bucket10"  # default; mirrors your curl's %TS:~0,10%
             )
+
+            
+
 
 
 
